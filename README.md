@@ -18,7 +18,30 @@ The converter and the full inference path (encoder → attention → decoder →
 
 ## Marian export and inference
 
-Install this fork (either `pip install -e python/` from a source checkout, or build and install a wheel). The converter CLI `ct2-marian-converter` and the Python entry point `ctranslate2.converters.MarianConverter` dispatch on the Marian config's `type:` field — `transformer` goes through the upstream path (works end-to-end), `s2s` goes through the new path (converts today, inference pending).
+Install this fork from source. The Python package is a pybind11 extension that links against `libctranslate2.so`, so you build the C++ library first and point `CTRANSLATE2_ROOT` at it:
+
+```bash
+git clone https://github.com/wa3dbk/CTranslate2-s2s.git
+cd CTranslate2-s2s
+git submodule update --init --recursive
+
+# 1) Build and install the C++ library to a prefix of your choice.
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local/ct2" \
+  -DWITH_MKL=OFF -DWITH_OPENBLAS=ON   # pick the BLAS backend available on your box
+cmake --build build -j
+cmake --install build
+
+# 2) Build the Python bindings against the installed library.
+export CTRANSLATE2_ROOT="$HOME/.local/ct2"
+export LD_LIBRARY_PATH="$CTRANSLATE2_ROOT/lib:$CTRANSLATE2_ROOT/lib64:$LD_LIBRARY_PATH"
+pip install -e python/
+```
+
+On CUDA machines pass `-DWITH_CUDA=ON -DWITH_CUDNN=ON` to the first `cmake` and make sure `nvcc` is on `PATH`. On macOS, Apple Accelerate is picked up automatically; replace the `-DWITH_OPENBLAS` flag with `-DWITH_ACCELERATE=ON`.
+
+The converter CLI `ct2-marian-converter` and the Python entry point `ctranslate2.converters.MarianConverter` dispatch on the Marian config's `type:` field — `transformer` goes through the upstream path, `s2s` goes through this fork's new path. Both call `translate_batch` identically from Python.
 
 Inputs expected by the converter:
 
