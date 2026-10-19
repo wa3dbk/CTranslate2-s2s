@@ -1,11 +1,83 @@
 #include "rnn.h"
 
 #include <stdexcept>
+#include <vector>
 
+#include "ctranslate2/decoding_utils.h"
 #include "ctranslate2/ops/ops.h"
 
 namespace ctranslate2 {
   namespace layers {
+
+    namespace {
+
+      // Build a float mask `[B, 1]` where entry b is 1.0 if `t < lengths[b]`,
+      // else 0.0. `lengths` is a 1-D int32 tensor on the same device as the
+      // output. If `lengths` is null, returns a tensor filled with ones.
+      StorageView make_timestep_mask(const StorageView* lengths,
+                                     dim_t batch_size,
+                                     dim_t t,
+                                     DataType dtype,
+                                     Device device) {
+        StorageView mask(Shape{batch_size, 1}, dtype, device);
+        if (!lengths) {
+          mask.fill(1.0f);
+          return mask;
+        }
+        const StorageView lengths_host = lengths->to(Device::CPU);
+        std::vector<float> values(batch_size, 0.0f);
+        for (dim_t b = 0; b < batch_size; ++b)
+          values[b] = (t < lengths_host.at<int32_t>(b)) ? 1.0f : 0.0f;
+        StorageView host_mask(Shape{batch_size, 1}, values);
+        if (device == Device::CPU)
+          mask = std::move(host_mask);
+        else
+          mask = host_mask.to(device);
+        return mask;
+      }
+
+      // Expand a `[B, 1]` tensor to `[B, D]` by tiling along the last axis.
+      void broadcast_to(const StorageView& mask_b1, dim_t D, StorageView& out) {
+        ops::Tile(1, D)(mask_b1, out);
+      }
+
+      // Returns `mask * a + (1 - mask) * b`, where `mask` is `[B, 1]` and `a`,
+      // `b` are `[B, D]`.
+      void select_by_mask(const StorageView& mask_b1,
+                          const StorageView& a,
+                          const StorageView& b,
+                          StorageView& out) {
+        const DataType dtype = a.dtype();
+        const Device device = a.device();
+        const dim_t D = a.dim(-1);
+
+        StorageView mask_bd(dtype, device);
+        broadcast_to(mask_b1, D, mask_bd);
+
+        // out = b + mask * (a - b)
+        StorageView diff(dtype, device);
+        ops::Sub()(a, b, diff);
+        StorageView scaled(dtype, device);
+        ops::Mul()(mask_bd, diff, scaled);
+        ops::Add()(b, scaled, out);
+      }
+
+      // Slice `[B, S, D]` along axis 1 at index t -> `[B, D]` using
+      // `Gather(axis=1, batch_dims=1)` with a per-batch constant index tensor.
+      void slice_time(const StorageView& bsd, dim_t t, StorageView& bd) {
+        const dim_t B = bsd.dim(0);
+        std::vector<int32_t> ids(B, static_cast<int32_t>(t));
+        StorageView index_host(Shape{B}, ids);
+        StorageView index = bsd.device() == Device::CPU
+                              ? std::move(index_host)
+                              : index_host.to(bsd.device());
+        StorageView tmp(bsd.dtype(), bsd.device());
+        ops::Gather(1, 1)(bsd, index, tmp);  // [B, D]
+        bd = std::move(tmp);
+      }
+
+    }
+
 
     // ---------------------------------------------------------------- GRUCell
 
@@ -116,18 +188,69 @@ namespace ctranslate2 {
       return _memory_dense.output_size();
     }
 
-    void BahdanauAttention::precompute(const StorageView& /*memory*/,
-                                       StorageView& /*projected_memory*/) const {
-      throw std::runtime_error("BahdanauAttention::precompute not implemented yet");
+    void BahdanauAttention::precompute(const StorageView& memory,
+                                       StorageView& projected_memory) const {
+      // Marian: `layerNorm(dot(memory, Wc_att), gammaContext_, b_att)`.
+      // Dense projects memory from `[B, S, 2H]` to `[B, S, A]`; LN applies
+      // along the last axis with `b_att` as the shift (beta).
+      const Device device = memory.device();
+      const DataType dtype = _memory_dense.output_type();
+      StorageView proj(dtype, device);
+      _memory_dense(memory, proj);
+      _ln_context(proj, projected_memory);
     }
 
-    void BahdanauAttention::compute(const StorageView& /*query*/,
-                                    const StorageView& /*projected_memory*/,
-                                    const StorageView& /*memory*/,
-                                    const StorageView& /*memory_lengths*/,
-                                    StorageView& /*context*/,
-                                    StorageView& /*alignment*/) const {
-      throw std::runtime_error("BahdanauAttention::compute not implemented yet");
+    void BahdanauAttention::compute(const StorageView& query,
+                                    const StorageView& projected_memory,
+                                    const StorageView& memory,
+                                    const StorageView& memory_lengths,
+                                    StorageView& context,
+                                    StorageView& alignment) const {
+      const Device device = query.device();
+      const DataType dtype = _query_dense.output_type();
+      const dim_t B = projected_memory.dim(0);
+      const dim_t S = projected_memory.dim(1);
+      const dim_t A = projected_memory.dim(2);
+      const dim_t E_mem = memory.dim(2);
+
+      // Query side: q = ln_state(Wa * query) -> [B, A].
+      StorageView q_proj(dtype, device);
+      _query_dense(query, q_proj);
+      StorageView q(dtype, device);
+      _ln_state(q_proj, q);
+
+      // Broadcast q over the time axis: [B, A] -> [B, 1, A] -> [B, S, A].
+      q.expand_dims(1);
+      StorageView q_bcast(dtype, device);
+      ops::Tile(1, S)(q, q_bcast);
+
+      // Pre-energy = tanh(q_bcast + projected_memory) -> [B, S, A].
+      StorageView pre(dtype, device);
+      ops::Add()(q_bcast, projected_memory, pre);
+      StorageView act(dtype, device);
+      ops::Tanh()(pre, act);
+
+      // Energy = act · v -> [B, S]. Reshape to [B*S, A] × [A, 1].
+      act.reshape(Shape{B * S, A});
+      StorageView v_col(dtype, device);
+      v_col.view(const_cast<float*>(_v.data<float>()), Shape{A, 1});
+      StorageView energy_flat(dtype, device);
+      ops::MatMul()(act, v_col, energy_flat);
+      energy_flat.reshape(Shape{B, S});
+      StorageView energy = std::move(energy_flat);
+
+      // Masked softmax along time axis.
+      ops::SoftMax()(energy, &memory_lengths, alignment);  // [B, S]
+
+      // Context: alignment [B, S] * memory [B, S, E_mem] -> [B, E_mem].
+      // Compute as [B, 1, S] × [B, S, E_mem] -> [B, 1, E_mem] -> squeeze.
+      StorageView align_row;
+      align_row.shallow_copy(alignment);
+      align_row.reshape(Shape{B, 1, S});
+      StorageView ctx3(dtype, device);
+      ops::MatMul()(align_row, memory, ctx3);  // [B, 1, E_mem]
+      ctx3.reshape(Shape{B, E_mem});
+      context = std::move(ctx3);
     }
 
 
@@ -148,11 +271,26 @@ namespace ctranslate2 {
       return _gru2.output_size();
     }
 
-    void CGRUDecoderCell::operator()(const StorageView&, const StorageView&,
-                                     const StorageView&, const StorageView&,
-                                     const StorageView&,
-                                     StorageView&, StorageView&, StorageView&) const {
-      throw std::runtime_error("CGRUDecoderCell::operator() not implemented yet");
+    void CGRUDecoderCell::operator()(const StorageView& input_emb,
+                                     const StorageView& prev_state,
+                                     const StorageView& projected_memory,
+                                     const StorageView& memory,
+                                     const StorageView& memory_lengths,
+                                     StorageView& new_state,
+                                     StorageView& context,
+                                     StorageView& alignment) const {
+      const Device device = input_emb.device();
+      const DataType dtype = input_emb.dtype();
+
+      // s1 = gru1(input_emb, prev_state).
+      StorageView s1(dtype, device);
+      _gru1(&input_emb, prev_state, s1);
+
+      // (context, alignment) = attention(query=s1, projected_memory, memory, lengths).
+      _attn.compute(s1, projected_memory, memory, memory_lengths, context, alignment);
+
+      // new_state = gru2(context, s1).
+      _gru2(&context, s1, new_state);
     }
 
 
@@ -173,10 +311,96 @@ namespace ctranslate2 {
       return 2 * _dim_rnn;
     }
 
-    void BiGRUEncoder::operator()(const std::vector<StorageView>& /*ids*/,
-                                  const StorageView* /*lengths*/,
-                                  StorageView& /*output*/) {
-      throw std::runtime_error("BiGRUEncoder::operator() not implemented yet");
+    void BiGRUEncoder::operator()(const std::vector<StorageView>& ids,
+                                  const StorageView* lengths,
+                                  StorageView& output) {
+      if (ids.empty())
+        throw std::invalid_argument("BiGRUEncoder requires one input id tensor");
+      const StorageView& token_ids = ids.front();
+
+      const Device device = token_ids.device();
+      const DataType dtype = _fwd.output_type();
+      const dim_t B = token_ids.dim(0);
+      const dim_t S = token_ids.dim(1);
+      const dim_t H = _dim_rnn;
+
+      // Embed ids [B, S] -> [B, S, E].
+      StorageView emb(dtype, device);
+      _embeddings(token_ids, emb);
+
+      // Forward pass: h_fwd[-1] = 0.
+      StorageView h_fwd_prev(Shape{B, H}, dtype, device);
+      h_fwd_prev.zero();
+      std::vector<StorageView> h_fwd(S);
+      for (dim_t t = 0; t < S; ++t) {
+        StorageView x_t(dtype, device);
+        slice_time(emb, t, x_t);
+        StorageView h_t(dtype, device);
+        _fwd(&x_t, h_fwd_prev, h_t);
+        if (lengths) {
+          // Keep h_fwd[t] = h_fwd[t-1] at pad positions so the state does not
+          // get polluted by padding ids but we still have a well-defined
+          // output to zero out at the end.
+          StorageView mask = make_timestep_mask(lengths, B, t, dtype, device);
+          StorageView gated(dtype, device);
+          select_by_mask(mask, h_t, h_fwd_prev, gated);
+          h_t = std::move(gated);
+        }
+        h_fwd_prev = h_t;  // copy
+        h_fwd[t] = std::move(h_t);
+      }
+
+      // Backward pass: h_bwd[S] = 0; skip updates where t >= lengths[b].
+      StorageView h_bwd_prev(Shape{B, H}, dtype, device);
+      h_bwd_prev.zero();
+      std::vector<StorageView> h_bwd(S);
+      for (dim_t t = S - 1; t >= 0; --t) {
+        StorageView x_t(dtype, device);
+        slice_time(emb, t, x_t);
+        StorageView h_t(dtype, device);
+        _bwd(&x_t, h_bwd_prev, h_t);
+        if (lengths) {
+          StorageView mask = make_timestep_mask(lengths, B, t, dtype, device);
+          StorageView gated(dtype, device);
+          select_by_mask(mask, h_t, h_bwd_prev, gated);
+          h_t = std::move(gated);
+        }
+        h_bwd_prev = h_t;
+        h_bwd[t] = std::move(h_t);
+      }
+
+      // Concat forward/backward per timestep, then stack along time axis.
+      std::vector<StorageView> stacked;
+      stacked.reserve(S);
+      for (dim_t t = 0; t < S; ++t) {
+        StorageView concat_t(dtype, device);
+        ops::Concat(-1)({&h_fwd[t], &h_bwd[t]}, concat_t);  // [B, 2H]
+        concat_t.expand_dims(1);  // [B, 1, 2H]
+        stacked.push_back(std::move(concat_t));
+      }
+      std::vector<const StorageView*> stacked_ptrs;
+      stacked_ptrs.reserve(S);
+      for (auto& s : stacked)
+        stacked_ptrs.push_back(&s);
+      ops::Concat(1)(stacked_ptrs, output);  // [B, S, 2H]
+
+      // Zero out padded positions in the output (match TransformerEncoder's
+      // post-padding semantics).
+      if (lengths) {
+        const StorageView lengths_host = lengths->to(Device::CPU);
+        if (device == Device::CPU) {
+          float* data = output.data<float>();
+          const dim_t stride_s = output.stride(1);
+          const dim_t stride_b = output.stride(0);
+          for (dim_t b = 0; b < B; ++b) {
+            const int32_t len = lengths_host.at<int32_t>(b);
+            for (dim_t t = len; t < S; ++t) {
+              float* row = data + b * stride_b + t * stride_s;
+              std::fill(row, row + 2 * H, 0.0f);
+            }
+          }
+        }
+      }
     }
 
 
@@ -195,23 +419,202 @@ namespace ctranslate2 {
     }
 
     DecoderState RNNDecoder::initial_state(bool /*iterative_decoding*/) const {
-      throw std::runtime_error("RNNDecoder::initial_state not implemented yet");
+      // Insert placeholders for state entries we populate lazily on step 0:
+      //   - "memory", "memory_lengths": set by the EncoderDecoderReplica
+      //     after this call (batch-only; see replicate_state).
+      //   - "projected_memory": the attention memory projection cache
+      //     (batch-only).
+      //   - "hidden": the running decoder hidden state (replicated per beam).
+      // Empty StorageViews are skipped by Decoder::replicate_state so inserting
+      // them here is safe.
+      DecoderState state;
+      const DataType dtype = output_type();
+      state.emplace("projected_memory", StorageView(dtype, _device));
+      state.emplace("hidden", StorageView(dtype, _device));
+      return state;
     }
 
-    void RNNDecoder::operator()(dim_t /*step*/,
-                                const StorageView& /*ids*/,
-                                DecoderState& /*state*/,
-                                StorageView* /*logits*/,
-                                StorageView* /*attention*/) {
-      throw std::runtime_error("RNNDecoder::operator()(step) not implemented yet");
+    // Mean-pools `[B, S, D]` over the valid time steps (per-batch length from
+    // `lengths`) into `[B, D]`. Pure CPU implementation; memory and lengths
+    // must live on the CPU device.
+    static void mean_pool_memory(const StorageView& memory,
+                                 const StorageView& lengths,
+                                 StorageView& pooled) {
+      const dim_t B = memory.dim(0);
+      const dim_t S = memory.dim(1);
+      const dim_t D = memory.dim(2);
+      pooled.resize(Shape{B, D});
+      const float* mem_data = memory.data<float>();
+      float* out = pooled.data<float>();
+      for (dim_t b = 0; b < B; ++b) {
+        const int32_t len = lengths.at<int32_t>(b);
+        if (len <= 0)
+          throw std::invalid_argument("RNNDecoder: memory_lengths must be positive");
+        for (dim_t d = 0; d < D; ++d) {
+          float sum = 0.0f;
+          for (dim_t t = 0; t < len; ++t)
+            sum += mem_data[(b * S + t) * D + d];
+          out[b * D + d] = sum / static_cast<float>(len);
+        }
+      }
     }
 
-    void RNNDecoder::operator()(const StorageView& /*ids*/,
-                                const StorageView& /*lengths*/,
-                                DecoderState& /*state*/,
-                                StorageView& /*logits*/,
-                                StorageView* /*attention*/) {
-      throw std::runtime_error("RNNDecoder::operator()(seq) not implemented yet");
+    // Ensures the lazy state entries ("projected_memory", "hidden") are
+    // populated. Must be called at the start of every step; it is a no-op after
+    // the first step.
+    void RNNDecoder::ensure_lazy_state(DecoderState& state, dim_t current_batch_size) {
+      StorageView& memory = state.at("memory");
+      const StorageView& memory_lengths = state.at("memory_lengths");
+
+      StorageView& projected_memory = state.at("projected_memory");
+      if (projected_memory.empty())
+        _cell.attention().precompute(memory, projected_memory);
+
+      StorageView& hidden = state.at("hidden");
+      if (hidden.empty()) {
+        // Mean-pool memory over valid timesteps and apply init-state MLP.
+        // The pooling must run on CPU; move to CPU and back if needed.
+        const Device device = memory.device();
+        StorageView memory_cpu = device == Device::CPU ? memory : memory.to(Device::CPU);
+        StorageView lengths_cpu = memory_lengths.device() == Device::CPU
+                                    ? memory_lengths : memory_lengths.to(Device::CPU);
+        StorageView pooled(DataType::FLOAT32, Device::CPU);
+        mean_pool_memory(memory_cpu, lengths_cpu, pooled);
+        if (device != Device::CPU)
+          pooled = pooled.to(device);
+
+        StorageView h0(output_type(), device);
+        _init_state_linear(pooled, h0);
+        StorageView h0_norm(output_type(), device);
+        _init_state_ln(h0, h0_norm);
+        hidden = std::move(h0_norm);
+
+        // Replicate to match the current (possibly beam-expanded) batch size.
+        const dim_t source_batch = hidden.dim(0);
+        if (current_batch_size > source_batch) {
+          if (current_batch_size % source_batch != 0)
+            throw std::invalid_argument(
+                "RNNDecoder: current batch size is not a multiple of source batch");
+          const dim_t repeats = current_batch_size / source_batch;
+          repeat_batch(hidden, repeats);
+        }
+      }
+    }
+
+    void RNNDecoder::operator()(dim_t step,
+                                const StorageView& ids,
+                                DecoderState& state,
+                                StorageView* logits,
+                                StorageView* attention) {
+      const Device device = ids.device();
+      const DataType dtype = output_type();
+
+      // Embed ids [B] -> [B, E]. The Embeddings op accepts [B] and returns [B, E].
+      StorageView embed(dtype, device);
+      _embeddings(ids, embed);
+
+      // On the first step, lazily build "projected_memory" and "hidden".
+      const dim_t B = embed.dim(0);
+      if (step == 0)
+        ensure_lazy_state(state, B);
+      else
+        ensure_lazy_state(state, B);  // Idempotent after first call.
+
+      StorageView& memory = state.at("memory");
+      StorageView& memory_lengths = state.at("memory_lengths");
+      StorageView& projected_memory = state.at("projected_memory");
+      StorageView& prev_hidden = state.at("hidden");
+
+      StorageView new_hidden(dtype, device);
+      StorageView context(dtype, device);
+      StorageView alignment(dtype, device);
+      _cell(embed, prev_hidden, projected_memory, memory, memory_lengths,
+            new_hidden, context, alignment);
+
+      // Deep-output: h_tilde = ln(linear(concat(new_hidden, context, embed))).
+      StorageView concat(dtype, device);
+      ops::Concat(-1)({&new_hidden, &context, &embed}, concat);
+      StorageView proj(dtype, device);
+      _hidden_linear(concat, proj);
+      StorageView h_tilde(dtype, device);
+      _hidden_ln(proj, h_tilde);
+
+      if (logits)
+        _output(h_tilde, *logits);
+
+      if (attention) {
+        // Expose [B, 1, S] layout to match the standard decoder convention.
+        StorageView align_out = alignment;
+        align_out.expand_dims(1);  // [B, 1, S]
+        *attention = std::move(align_out);
+      }
+
+      state["hidden"] = std::move(new_hidden);
+    }
+
+    void RNNDecoder::operator()(const StorageView& ids,
+                                const StorageView& lengths,
+                                DecoderState& state,
+                                StorageView& logits,
+                                StorageView* attention) {
+      // Teacher-forced sequence pass. Loops over target steps carrying hidden
+      // state and stacks logits along the time axis.
+      const Device device = ids.device();
+      const DataType dtype = output_type();
+      const dim_t B = ids.dim(0);
+      const dim_t T = ids.dim(1);
+      (void)lengths;  // Length masking of the target is applied by the caller
+                      // via the final log-prob reduction; this loop simply
+                      // forwards each timestep.
+
+      std::vector<StorageView> step_logits;
+      step_logits.reserve(T);
+      std::vector<StorageView> step_attn;
+      if (attention)
+        step_attn.reserve(T);
+
+      for (dim_t t = 0; t < T; ++t) {
+        // Build [B] slice from ids [B, T].
+        StorageView ids_t(DataType::INT32, device);
+        {
+          std::vector<int32_t> idx(B, static_cast<int32_t>(t));
+          StorageView index_host(Shape{B}, idx);
+          StorageView index = device == Device::CPU
+                                ? std::move(index_host)
+                                : index_host.to(device);
+          StorageView gathered(ids.dtype(), device);
+          ops::Gather(1, 1)(ids, index, gathered);
+          ids_t = std::move(gathered);
+        }
+
+        StorageView logits_t(dtype, device);
+        StorageView attn_t(dtype, device);
+        operator()(t, ids_t, state, &logits_t, attention ? &attn_t : nullptr);
+        step_logits.push_back(std::move(logits_t));
+        if (attention)
+          step_attn.push_back(std::move(attn_t));
+      }
+
+      // Stack along axis 1: each entry is [B, V] -> [B, 1, V] -> concat.
+      std::vector<StorageView> expanded_logits;
+      expanded_logits.reserve(T);
+      for (auto& lt : step_logits) {
+        lt.expand_dims(1);
+        expanded_logits.push_back(std::move(lt));
+      }
+      std::vector<const StorageView*> logit_ptrs;
+      logit_ptrs.reserve(T);
+      for (auto& e : expanded_logits)
+        logit_ptrs.push_back(&e);
+      ops::Concat(1)(logit_ptrs, logits);  // [B, T, V]
+
+      if (attention) {
+        std::vector<const StorageView*> attn_ptrs;
+        attn_ptrs.reserve(T);
+        for (auto& a : step_attn)
+          attn_ptrs.push_back(&a);
+        ops::Concat(1)(attn_ptrs, *attention);
+      }
     }
 
     bool RNNDecoder::replicate_state(const std::string& name) const {

@@ -103,6 +103,8 @@ namespace ctranslate2 {
       DataType output_type() const override;
       dim_t output_size() const override;
 
+      using Encoder::operator();
+
     protected:
       void operator()(const std::vector<StorageView>& ids,
                       const StorageView* lengths,
@@ -135,11 +137,14 @@ namespace ctranslate2 {
                       StorageView* attention = nullptr) override;
 
       bool replicate_state(const std::string& name) const override;
+      using Decoder::replicate_state;
 
     protected:
       Dense& output_layer() override { return _output; }
 
     private:
+      void ensure_lazy_state(DecoderState& state, dim_t current_batch_size);
+
       Embeddings _embeddings;
       Dense _init_state_linear;
       LayerNorm _init_state_ln;
