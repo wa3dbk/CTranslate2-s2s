@@ -99,10 +99,17 @@ def _write_fake_npz(tmp_path, config, extra_tensors=None):
         "decoder_ff_state_W": np.full((2 * H, H), 1.0, dtype=np.float32),
         "decoder_ff_state_b": np.full((1, H), 1.0, dtype=np.float32),
         "decoder_ff_state_gamma": np.full((1, H), 1.0, dtype=np.float32),
-        # Deep output hidden (ff_logit_l1): [I + H + 2H, I].
-        "decoder_ff_logit_l1_W": np.full((I + H + 2 * H, I), 1.0, dtype=np.float32),
-        "decoder_ff_logit_l1_b": np.full((1, I), 1.0, dtype=np.float32),
-        "decoder_ff_logit_l1_gamma": np.full((1, I), 1.0, dtype=np.float32),
+        # Deep output hidden (ff_logit_l1): one Dense sub-affine per input
+        # (embeddings, decoder hidden, aligned context). All project to dim-emb.
+        "decoder_ff_logit_l1_W0": np.full((I, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_b0": np.full((1, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_gamma0": np.full((1, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_W1": np.full((H, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_b1": np.full((1, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_gamma1": np.full((1, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_W2": np.full((2 * H, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_b2": np.full((1, I), 1.0, dtype=np.float32),
+        "decoder_ff_logit_l1_gamma2": np.full((1, I), 1.0, dtype=np.float32),
         # Deep output top (ff_logit_l2): bias only; W tied to Wemb.
         "decoder_ff_logit_l2_b": np.full((1, V), 0.0, dtype=np.float32),
     }
@@ -228,14 +235,15 @@ def test_s2s_base_config_loads(tmp_path):
     converter = _make_converter(tmp_path, config)
     spec = converter._load()
     assert spec.name == "RNNModelSpec"
-    assert spec.revision == 1
+    assert spec.revision == 2
 
 
 def test_s2s_weight_mapping_gate_order(tmp_path):
     """Marian gate order is `[reset | update | candidate]`. The converter must
     concatenate `[_U | _Ux]` on the last axis so that recurrent_weight is
     `[reset=1.0 | update=1.0 | candidate=2.0]` when `_U` was filled with 1.0
-    and `_Ux` with 2.0.
+    and `_Ux` with 2.0. The weight is then transposed from Marian's
+    `[in, out]` to CT2's `[out, in]`.
     """
     config = _s2s_base_config()
     converter = _make_converter(tmp_path, config)
@@ -244,19 +252,21 @@ def test_s2s_weight_mapping_gate_order(tmp_path):
     H = config["dim-rnn"]
     I = config["dim-emb"]
     rec = spec.encoder.forward_cell.recurrent.weight
-    assert rec.shape == (H, 3 * H)
-    assert np.allclose(rec[:, : 2 * H], 1.0)
-    assert np.allclose(rec[:, 2 * H :], 2.0)
+    # CT2 layout is [out, in] = [3H, H] with gate order on axis 0.
+    assert rec.shape == (3 * H, H)
+    assert np.allclose(rec[: 2 * H, :], 1.0)
+    assert np.allclose(rec[2 * H :, :], 2.0)
 
     inp = spec.encoder.forward_cell.input.weight
-    assert inp.shape == (I, 3 * H)
-    assert np.allclose(inp[:, : 2 * H], 3.0)
-    assert np.allclose(inp[:, 2 * H :], 4.0)
+    assert inp.shape == (3 * H, I)
+    assert np.allclose(inp[: 2 * H, :], 3.0)
+    assert np.allclose(inp[2 * H :, :], 4.0)
 
+    # Input-side bias is zeros; `_b/_bx` land on ln_input.beta per the Marian
+    # LN-shift convention (see test_s2s_cell_bias_lives_on_ln_input_beta).
     bias = spec.encoder.forward_cell.input.bias
     assert bias.shape == (3 * H,)
-    assert np.allclose(bias[: 2 * H], 5.0)
-    assert np.allclose(bias[2 * H :], 6.0)
+    assert np.allclose(bias, 0.0)
 
 
 def test_s2s_attention_wiring(tmp_path):
@@ -266,7 +276,8 @@ def test_s2s_attention_wiring(tmp_path):
 
     H = config["dim-rnn"]
     attn = spec.decoder.cell.attention
-    assert attn.query.weight.shape == (H, 2 * H)
+    # CT2 Dense layout is [out, in]. Query: [A=2H, H_dec=H]; Memory: [A=2H, 2H].
+    assert attn.query.weight.shape == (2 * H, H)
     assert attn.memory.weight.shape == (2 * H, 2 * H)
     assert attn.v.shape == (2 * H,)
     assert attn.ln_context.gamma.shape == (2 * H,)
@@ -299,6 +310,58 @@ def test_s2s_unused_tensor_errors(tmp_path):
     converter = _make_converter(tmp_path, config, extra_tensors=extra)
     with pytest.raises(ValueError, match="encoder_bi_junk"):
         converter._load()
+
+
+def test_s2s_cell_bias_lives_on_ln_input_beta(tmp_path):
+    """Marian's layer-normalized Dense is `LN(W @ x, gamma, b)`, so Marian's
+    `_b/_bx` must land on `ln_input.beta`, not `input.bias`. The latter would
+    inject `(b - mean(b)) / sigma` into the pre-norm tensor rather than
+    adding `b` as the LN shift."""
+    config = _s2s_base_config()
+    converter = _make_converter(tmp_path, config)
+    spec = converter._load()
+    H = config["dim-rnn"]
+    cell = spec.encoder.forward_cell
+    # input.bias is zeros; ln_input.beta carries the concat of (_b, _bx).
+    assert np.allclose(cell.input.bias, 0.0)
+    assert cell.ln_input.beta.shape == (3 * H,)
+    assert np.allclose(cell.ln_input.beta[: 2 * H], 5.0)  # _b
+    assert np.allclose(cell.ln_input.beta[2 * H :], 6.0)  # _bx
+
+
+def test_s2s_init_state_bias_lives_on_layer_norm_beta(tmp_path):
+    """Same LN-shift convention for `decoder_ff_state`: `_b` must land on
+    `layer_norm.beta`, and `linear.bias` must be zeros."""
+    config = _s2s_base_config()
+    converter = _make_converter(tmp_path, config)
+    spec = converter._load()
+    init = spec.decoder.init_state
+    assert np.allclose(init.linear.bias, 0.0)
+    assert np.allclose(init.layer_norm.beta, 1.0)  # fake npz has _b = 1.0
+
+
+def test_s2s_deep_output_has_three_sub_affines(tmp_path):
+    """`ff_logit_l1` with layer-normalization is a 3-way deep output: one
+    Dense+LN sub-affine per input (embeddings, hidden, context), summed and
+    tanh-ed. Each sub-affine stores its `_b{i}` on `layer_norm.beta`."""
+    config = _s2s_base_config()
+    converter = _make_converter(tmp_path, config)
+    spec = converter._load()
+    H = config["dim-rnn"]
+    I = config["dim-emb"]
+    deep = spec.decoder.hidden
+    # proj_embed: dim_emb -> dim_emb.
+    assert deep.proj_embed.linear.weight.shape == (I, I)
+    assert np.allclose(deep.proj_embed.linear.bias, 0.0)
+    assert np.allclose(deep.proj_embed.layer_norm.beta, 1.0)
+    # proj_state: dim_rnn -> dim_emb.
+    assert deep.proj_state.linear.weight.shape == (I, H)
+    assert np.allclose(deep.proj_state.linear.bias, 0.0)
+    assert np.allclose(deep.proj_state.layer_norm.beta, 1.0)
+    # proj_context: 2*dim_rnn -> dim_emb.
+    assert deep.proj_context.linear.weight.shape == (I, 2 * H)
+    assert np.allclose(deep.proj_context.linear.bias, 0.0)
+    assert np.allclose(deep.proj_context.layer_norm.beta, 1.0)
 
 
 def test_s2s_missing_tensor_errors(tmp_path):

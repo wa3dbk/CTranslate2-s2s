@@ -412,8 +412,9 @@ namespace ctranslate2 {
       , _init_state_linear(model, scope + "/init_state/linear")
       , _init_state_ln(model, scope + "/init_state/layer_norm")
       , _cell(model, scope + "/cell")
-      , _hidden_linear(model, scope + "/hidden/linear")
-      , _hidden_ln(model, scope + "/hidden/layer_norm")
+      , _hidden_embed(model,   scope + "/hidden/proj_embed")
+      , _hidden_state(model,   scope + "/hidden/proj_state")
+      , _hidden_context(model, scope + "/hidden/proj_context")
       , _output(model, scope + "/output")
       , _dim_rnn(_cell.output_size()) {
     }
@@ -531,13 +532,34 @@ namespace ctranslate2 {
       _cell(embed, prev_hidden, projected_memory, memory, memory_lengths,
             new_hidden, context, alignment);
 
-      // Deep-output: h_tilde = ln(linear(concat(new_hidden, context, embed))).
-      StorageView concat(dtype, device);
-      ops::Concat(-1)({&new_hidden, &context, &embed}, concat);
-      StorageView proj(dtype, device);
-      _hidden_linear(concat, proj);
+      // Deep-output: Marian builds `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))`
+      // where `i` iterates over (embeddings, decoder hidden, aligned context).
+      // Each sub-affine has distinct weights/gamma/beta — do NOT fuse by
+      // concatenating inputs through a single Dense+LN.
+      StorageView y0(dtype, device);
+      {
+        StorageView proj(dtype, device);
+        _hidden_embed.linear(embed, proj);
+        _hidden_embed.layer_norm(proj, y0);
+      }
+      StorageView y1(dtype, device);
+      {
+        StorageView proj(dtype, device);
+        _hidden_state.linear(new_hidden, proj);
+        _hidden_state.layer_norm(proj, y1);
+      }
+      StorageView y2(dtype, device);
+      {
+        StorageView proj(dtype, device);
+        _hidden_context.linear(context, proj);
+        _hidden_context.layer_norm(proj, y2);
+      }
+      StorageView sum01(dtype, device);
+      ops::Add()(y0, y1, sum01);
+      StorageView sum012(dtype, device);
+      ops::Add()(sum01, y2, sum012);
       StorageView h_tilde(dtype, device);
-      _hidden_ln(proj, h_tilde);
+      ops::Tanh()(sum012, h_tilde);
 
       if (logits)
         _output(h_tilde, *logits);

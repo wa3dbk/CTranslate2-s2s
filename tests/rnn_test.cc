@@ -5,6 +5,7 @@
 #include "ctranslate2/layers/decoder.h"
 #include "ctranslate2/models/model.h"
 
+#include "ctranslate2/ops/ops.h"
 #include "layers/rnn.h"
 
 using namespace ctranslate2;
@@ -523,13 +524,32 @@ TEST(RNNTest, RNNDecoderReplicateStateHonorsBatchOnlyEntries) {
                     cgru_gru2_g_in, cgru_gru2_g_rec);
   register_bahdanau(model, "decoder/cell/attention", A, H, E_mem,
                     cgru_Wq, cgru_Wm, cgru_v, cgru_g_state, cgru_g_ctx, cgru_b_ctx);
-  model.register_variable("decoder/hidden/linear/weight",
-                          StorageView({H, H + E_mem + E_dec}, std::vector<float>(H * (H + E_mem + E_dec), 0.0f)));
-  model.register_variable("decoder/hidden/linear/bias",
+  // Deep-output: three sub-affines, each projecting its input to the
+  // deep-output dimension (here H, matching the output of the gru/attention
+  // stack feeding into the output projection).
+  model.register_variable("decoder/hidden/proj_embed/linear/weight",
+                          StorageView({H, E_dec}, std::vector<float>(H * E_dec, 0.0f)));
+  model.register_variable("decoder/hidden/proj_embed/linear/bias",
                           StorageView({H}, std::vector<float>(H, 0.0f)));
-  model.register_variable("decoder/hidden/layer_norm/gamma",
+  model.register_variable("decoder/hidden/proj_embed/layer_norm/gamma",
                           StorageView({H}, std::vector<float>(H, 1.0f)));
-  model.register_variable("decoder/hidden/layer_norm/beta",
+  model.register_variable("decoder/hidden/proj_embed/layer_norm/beta",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/linear/weight",
+                          StorageView({H, H}, std::vector<float>(H * H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/linear/bias",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/layer_norm/gamma",
+                          StorageView({H}, std::vector<float>(H, 1.0f)));
+  model.register_variable("decoder/hidden/proj_state/layer_norm/beta",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/linear/weight",
+                          StorageView({H, E_mem}, std::vector<float>(H * E_mem, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/linear/bias",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/layer_norm/gamma",
+                          StorageView({H}, std::vector<float>(H, 1.0f)));
+  model.register_variable("decoder/hidden/proj_context/layer_norm/beta",
                           StorageView({H}, std::vector<float>(H, 0.0f)));
   model.register_variable("decoder/output/weight",
                           StorageView({V, H}, std::vector<float>(V * H, 0.0f)));
@@ -585,13 +605,34 @@ TEST(RNNTest, RNNDecoderSingleStepMatchesReference) {
                     cgru_gru2_g_in, cgru_gru2_g_rec);
   register_bahdanau(model, "decoder/cell/attention", A, H, E_mem,
                     cgru_Wq, cgru_Wm, cgru_v, cgru_g_state, cgru_g_ctx, cgru_b_ctx);
-  model.register_variable("decoder/hidden/linear/weight",
-                          StorageView({H, H + E_mem + E_dec}, std::vector<float>(H * (H + E_mem + E_dec), 0.0f)));
-  model.register_variable("decoder/hidden/linear/bias",
+  // Deep-output: three sub-affines, each projecting its input to the
+  // deep-output dimension. Weights are zero here — the test is intentionally
+  // shape-only; a numeric fixture for the full deep-output path (with
+  // non-trivial weights and the tanh activation) lives in
+  // `RNNDecoderDeepOutputMatchesReference` below.
+  model.register_variable("decoder/hidden/proj_embed/linear/weight",
+                          StorageView({H, E_dec}, std::vector<float>(H * E_dec, 0.0f)));
+  model.register_variable("decoder/hidden/proj_embed/linear/bias",
                           StorageView({H}, std::vector<float>(H, 0.0f)));
-  model.register_variable("decoder/hidden/layer_norm/gamma",
+  model.register_variable("decoder/hidden/proj_embed/layer_norm/gamma",
                           StorageView({H}, std::vector<float>(H, 1.0f)));
-  model.register_variable("decoder/hidden/layer_norm/beta",
+  model.register_variable("decoder/hidden/proj_embed/layer_norm/beta",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/linear/weight",
+                          StorageView({H, H}, std::vector<float>(H * H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/linear/bias",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_state/layer_norm/gamma",
+                          StorageView({H}, std::vector<float>(H, 1.0f)));
+  model.register_variable("decoder/hidden/proj_state/layer_norm/beta",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/linear/weight",
+                          StorageView({H, E_mem}, std::vector<float>(H * E_mem, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/linear/bias",
+                          StorageView({H}, std::vector<float>(H, 0.0f)));
+  model.register_variable("decoder/hidden/proj_context/layer_norm/gamma",
+                          StorageView({H}, std::vector<float>(H, 1.0f)));
+  model.register_variable("decoder/hidden/proj_context/layer_norm/beta",
                           StorageView({H}, std::vector<float>(H, 0.0f)));
   model.register_variable("decoder/output/weight",
                           StorageView({V, H}, std::vector<float>(V * H, 0.0f)));
@@ -628,4 +669,125 @@ TEST(RNNTest, RNNDecoderSingleStepMatchesReference) {
   ASSERT_EQ(attention.dim(0), B);
   ASSERT_EQ(attention.dim(1), 1);
   ASSERT_EQ(attention.dim(2), S);
+}
+
+
+// Numeric fixture for the deep-output path with non-trivial weights.
+//
+// Marian builds the deep-output hidden layer as
+//   l1 = tanh( LN(W0 @ embed,   gamma0, b0)
+//            + LN(W1 @ hidden,  gamma1, b1)
+//            + LN(W2 @ context, gamma2, b2) )
+// The reference below is computed with numpy using the same math (epsilon
+// = 1e-9 to match the s2s converter's `layer_norm_epsilon`). The test wires
+// the three sub-affines directly (same `Dense`+`LayerNorm` layers that
+// `RNNDecoder` uses) so a regression on the Marian LN-shift convention
+// (`b` on `layer_norm.beta`, not `linear.bias`) is caught at the math level.
+TEST(RNNTest, DeepOutputMatchesReference) {
+  constexpr dim_t B = 2;
+  constexpr dim_t E = 2;   // embed dim
+  constexpr dim_t Hd = 2;  // hidden (decoder state) dim
+  constexpr dim_t M = 2;   // aligned-context dim
+  constexpr dim_t D = 3;   // deep-output dim
+  constexpr dim_t V = 4;   // vocab
+
+  RNNMockModel model;
+  model.config["layer_norm_epsilon"] = 1e-9;
+
+  // proj_embed: W0 [D, E], beta = b0 (Marian LN shift).
+  model.register_variable("deep/proj_embed/linear/weight",
+      StorageView({D, E}, std::vector<float>{
+          0.40000001f, -0.10000000f,
+          0.20000000f,  0.30000001f,
+         -0.10000000f,  0.50000000f}));
+  model.register_variable("deep/proj_embed/linear/bias",
+      StorageView({D}, std::vector<float>(D, 0.0f)));
+  model.register_variable("deep/proj_embed/layer_norm/gamma",
+      StorageView({D}, std::vector<float>{1.1f, 0.9f, 1.0f}));
+  model.register_variable("deep/proj_embed/layer_norm/beta",
+      StorageView({D}, std::vector<float>{0.1f, -0.2f, 0.3f}));
+
+  // proj_state: W1 [D, Hd], beta = b1.
+  model.register_variable("deep/proj_state/linear/weight",
+      StorageView({D, Hd}, std::vector<float>{
+           0.30000001f,  0.20000000f,
+          -0.40000001f,  0.10000000f,
+           0.50000000f, -0.30000001f}));
+  model.register_variable("deep/proj_state/linear/bias",
+      StorageView({D}, std::vector<float>(D, 0.0f)));
+  model.register_variable("deep/proj_state/layer_norm/gamma",
+      StorageView({D}, std::vector<float>{0.95f, 1.05f, 1.0f}));
+  model.register_variable("deep/proj_state/layer_norm/beta",
+      StorageView({D}, std::vector<float>{-0.1f, 0.1f, 0.0f}));
+
+  // proj_context: W2 [D, M], beta = b2.
+  model.register_variable("deep/proj_context/linear/weight",
+      StorageView({D, M}, std::vector<float>{
+           0.10000000f, -0.20000000f,
+           0.30000001f,  0.40000001f,
+          -0.50000000f,  0.20000000f}));
+  model.register_variable("deep/proj_context/linear/bias",
+      StorageView({D}, std::vector<float>(D, 0.0f)));
+  model.register_variable("deep/proj_context/layer_norm/gamma",
+      StorageView({D}, std::vector<float>{1.0f, 1.0f, 1.1f}));
+  model.register_variable("deep/proj_context/layer_norm/beta",
+      StorageView({D}, std::vector<float>{0.0f, -0.1f, 0.2f}));
+
+  // Output projection [V, D] and bias [V].
+  model.register_variable("out/weight",
+      StorageView({V, D}, std::vector<float>{
+           0.20000000f, -0.10000000f,  0.30000001f,
+          -0.30000001f,  0.10000000f,  0.20000000f,
+           0.40000001f,  0.00000000f, -0.20000000f,
+           0.10000000f,  0.30000001f, -0.10000000f}));
+  model.register_variable("out/bias",
+      StorageView({V}, std::vector<float>{0.0f, 0.1f, -0.1f, 0.2f}));
+
+  model.finalize();
+
+  layers::Dense     proj_embed_lin(model, "deep/proj_embed/linear");
+  layers::LayerNorm proj_embed_ln (model, "deep/proj_embed/layer_norm");
+  layers::Dense     proj_state_lin(model, "deep/proj_state/linear");
+  layers::LayerNorm proj_state_ln (model, "deep/proj_state/layer_norm");
+  layers::Dense     proj_context_lin(model, "deep/proj_context/linear");
+  layers::LayerNorm proj_context_ln (model, "deep/proj_context/layer_norm");
+  layers::Dense     out_proj(model, "out");
+
+  const StorageView embed  ({B, E},  std::vector<float>{0.1f, -0.2f,  0.3f,  0.4f});
+  const StorageView hidden ({B, Hd}, std::vector<float>{0.5f,  0.1f, -0.1f,  0.2f});
+  const StorageView context({B, M},  std::vector<float>{0.2f, -0.1f,  0.3f, -0.3f});
+
+  // Replicate `RNNDecoder::operator()` deep-output block exactly.
+  StorageView y0, y1, y2;
+  {
+    StorageView proj;
+    proj_embed_lin(embed, proj);
+    proj_embed_ln(proj, y0);
+  }
+  {
+    StorageView proj;
+    proj_state_lin(hidden, proj);
+    proj_state_ln(proj, y1);
+  }
+  {
+    StorageView proj;
+    proj_context_lin(context, proj);
+    proj_context_ln(proj, y2);
+  }
+  StorageView sum01, sum012;
+  ops::Add()(y0, y1, sum01);
+  ops::Add()(sum01, y2, sum012);
+  StorageView h_tilde;
+  ops::Tanh()(sum012, h_tilde);
+  StorageView logits;
+  out_proj(h_tilde, logits);
+
+  const StorageView expected_h_tilde({B, D}, std::vector<float>{
+       0.99262494f, -0.84621823f, -0.87465835f,
+      -0.10256468f,  0.94420367f, -0.93410003f});
+  const StorageView expected_logits({B, V}, std::vector<float>{
+       0.02074931f, -0.45734099f,  0.47198167f,  0.13286287f,
+      -0.39516333f,  0.03836976f,  0.04579414f,  0.56641465f});
+  expect_storage_eq(h_tilde, expected_h_tilde, 2e-5);
+  expect_storage_eq(logits,  expected_logits,  2e-5);
 }

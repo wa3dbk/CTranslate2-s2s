@@ -63,13 +63,36 @@ class CGRUDecoderCellSpec(model_spec.LayerSpec):
 class DenseLNSpec(model_spec.LayerSpec):
     """Affine (`W`, `b`) followed by scale-only layer norm.
 
-    Used by Marian's `ff_state` (init-state MLP) and `ff_logit_l1`
-    (deep-output hidden layer).
+    Used by Marian's `ff_state` (init-state MLP).
+
+    Marian computes `layerNorm(dot(x, W), gamma, b)` — i.e. `b` is the LN
+    *shift*, not an affine bias. The converter stores `b` on
+    `layer_norm.beta` and leaves `linear.bias` as zeros.
     """
 
     def __init__(self):
         self.linear = common_spec.LinearSpec()
         self.layer_norm = common_spec.LayerNormSpec()
+
+
+class DeepOutputSpec(model_spec.LayerSpec):
+    """Marian's `ff_logit_l1` deep-output hidden layer.
+
+    With `layer-normalization: true`, Marian builds a separate Dense+LN
+    sub-affine per input (embeddings, decoder hidden, aligned context), sums
+    the three LN outputs, and applies `tanh`. Each sub-affine stores `b` as
+    the LN shift (same convention as `DenseLNSpec`).
+
+    Sub-layers map to Marian indices as follows:
+      - `proj_embed`   ← `_W0 / _b0 / _gamma0` (embeddings:   dim_emb → dim_emb)
+      - `proj_state`   ← `_W1 / _b1 / _gamma1` (hidden:       dim_rnn → dim_emb)
+      - `proj_context` ← `_W2 / _b2 / _gamma2` (context:   2*dim_rnn → dim_emb)
+    """
+
+    def __init__(self):
+        self.proj_embed = DenseLNSpec()
+        self.proj_state = DenseLNSpec()
+        self.proj_context = DenseLNSpec()
 
 
 class BiGRUEncoderSpec(model_spec.LayerSpec):
@@ -84,7 +107,7 @@ class RNNDecoderSpec(model_spec.LayerSpec):
         self.embeddings = common_spec.EmbeddingsSpec()
         self.init_state = DenseLNSpec()
         self.cell = CGRUDecoderCellSpec()
-        self.hidden = DenseLNSpec()
+        self.hidden = DeepOutputSpec()
         self.output = common_spec.LinearSpec()
 
 
@@ -102,7 +125,7 @@ class RNNModelSpec(model_spec.SequenceToSequenceModelSpec):
 
     @property
     def revision(self):
-        return 1
+        return 2
 
     def get_source_vocabulary_size(self):
         return [self.encoder.embeddings.weight.shape[0]]

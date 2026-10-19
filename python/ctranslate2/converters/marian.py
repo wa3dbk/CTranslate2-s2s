@@ -222,9 +222,12 @@ def _s2s_load_cell(spec_cell, model, prefix, dim_rnn):
     b = model["%s_b" % prefix]
     bx = model["%s_bx" % prefix]
     spec_cell.input.weight = _s2s_gate_concat(W, Wx).astype(np.float32)
-    spec_cell.input.bias = _s2s_bias_concat(b, bx).astype(np.float32)
+    # Marian's layer-normalized Dense is `layerNorm(dot(x, W), gamma, b)` — the
+    # bias is the LN *shift*, not an affine Dense bias. Store it on ln_input.beta
+    # and leave input.bias as zeros so CT2 computes the exact Marian math.
+    spec_cell.input.bias = np.zeros(3 * H, dtype=np.float32)
     spec_cell.ln_input.gamma = model["%s_gamma1" % prefix].reshape(-1).astype(np.float32)
-    spec_cell.ln_input.beta = np.zeros(3 * H, dtype=np.float32)
+    spec_cell.ln_input.beta = _s2s_bias_concat(b, bx).astype(np.float32)
 
 
 def _s2s_load_attention(spec_attn, model, prefix, dim_enc):
@@ -245,14 +248,48 @@ def _s2s_load_dense_ln(spec_dense_ln, model, prefix):
     """Populate a `DenseLNSpec` from `<prefix>_W/_b/_gamma`.
 
     Marian stores `_W` as `[in, out]`; CT2 Dense expects `[out, in]`.
+
+    Marian's layer-normalized Dense is `layerNorm(dot(x, W), gamma, b)` — `b` is
+    the LN *shift*, not an affine Dense bias. We store `b` on
+    `layer_norm.beta` and leave `linear.bias` as zeros so CT2's
+    `LayerNorm(gamma * (x - mean)/sigma + beta)` reproduces Marian's exact
+    math; the alternative (b on linear.bias) would subtract `mean(b)` and
+    inject the zero-mean projection of `b` into the pre-norm tensor, which is
+    not equivalent.
     """
     weight = model["%s_W" % prefix].T.astype(np.float32)
     bias = model["%s_b" % prefix].reshape(-1).astype(np.float32)
     gamma = model["%s_gamma" % prefix].reshape(-1).astype(np.float32)
     spec_dense_ln.linear.weight = weight
-    spec_dense_ln.linear.bias = bias
+    spec_dense_ln.linear.bias = np.zeros_like(bias)
     spec_dense_ln.layer_norm.gamma = gamma
-    spec_dense_ln.layer_norm.beta = np.zeros_like(gamma)
+    spec_dense_ln.layer_norm.beta = bias
+
+
+def _s2s_load_dense_ln_indexed(spec_dense_ln, model, prefix, index):
+    """Variant of `_s2s_load_dense_ln` for Marian's multi-input `mlp::dense`
+    with layer-normalization enabled: tensors are stored under
+    `<prefix>_W{i}` / `<prefix>_b{i}` / `<prefix>_gamma{i}` (one sub-affine
+    per input of the parent `mlp::dense`)."""
+    weight = model["%s_W%d" % (prefix, index)].T.astype(np.float32)
+    bias = model["%s_b%d" % (prefix, index)].reshape(-1).astype(np.float32)
+    gamma = model["%s_gamma%d" % (prefix, index)].reshape(-1).astype(np.float32)
+    spec_dense_ln.linear.weight = weight
+    spec_dense_ln.linear.bias = np.zeros_like(bias)
+    spec_dense_ln.layer_norm.gamma = gamma
+    spec_dense_ln.layer_norm.beta = bias
+
+
+def _s2s_load_deep_output(spec_deep, model, prefix):
+    """Populate a `DeepOutputSpec` from Marian's `ff_logit_l1` sub-affines.
+
+    Marian builds the deep-output hidden layer as
+    `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))` with inputs in order
+    `(embeddings, decoderStates, alignedContext)`. Each `_i` is stored as
+    `<prefix>_W{i}` / `<prefix>_b{i}` / `<prefix>_gamma{i}`.
+    """
+    for sub_name, i in (("proj_embed", 0), ("proj_state", 1), ("proj_context", 2)):
+        _s2s_load_dense_ln_indexed(getattr(spec_deep, sub_name), model, prefix, i)
 
 
 def _s2s_expected_tensor_names():
@@ -264,9 +301,13 @@ def _s2s_expected_tensor_names():
     for sfx in ("_W_comb_att", "_Wc_att", "_U_att", "_b_att",
                 "_att_gamma1", "_att_gamma2"):
         names.add("decoder" + sfx)
-    for prefix in ("decoder_ff_state", "decoder_ff_logit_l1"):
-        for sfx in ("_W", "_b", "_gamma"):
-            names.add(prefix + sfx)
+    for sfx in ("_W", "_b", "_gamma"):
+        names.add("decoder_ff_state" + sfx)
+    # ff_logit_l1 has one Dense sub-affine per input (embeddings, hidden,
+    # context) when layer-normalization is enabled.
+    for i in range(3):
+        for sfx in ("_W%d" % i, "_b%d" % i, "_gamma%d" % i):
+            names.add("decoder_ff_logit_l1" + sfx)
     names.add("decoder_ff_logit_l2_b")
     return names
 
@@ -334,7 +375,7 @@ def _build_s2s_spec(config, model, vocabs):
     _s2s_load_attention(spec.decoder.cell.attention, model, "decoder", dim_enc=2 * H)
 
     _s2s_load_dense_ln(spec.decoder.init_state, model, "decoder_ff_state")
-    _s2s_load_dense_ln(spec.decoder.hidden,     model, "decoder_ff_logit_l1")
+    _s2s_load_deep_output(spec.decoder.hidden,  model, "decoder_ff_logit_l1")
 
     # Deep-output top layer: Wt is tied-transposed to Wemb; only the bias is
     # independent in Marian. The spec stores the tied weight here; LayerSpec

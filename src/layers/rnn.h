@@ -145,12 +145,25 @@ namespace ctranslate2 {
     private:
       void ensure_lazy_state(DecoderState& state, dim_t current_batch_size);
 
+      // One Marian `mlp::dense` sub-affine with scale-only layer norm:
+      // computes `LN(W @ x, gamma, beta)`. The deep-output path holds three
+      // of these (one per input: embeddings, decoder hidden, aligned context).
+      struct DenseLN {
+        Dense linear;
+        LayerNorm layer_norm;
+
+        DenseLN(const models::Model& model, const std::string& scope)
+          : linear(model, scope + "/linear")
+          , layer_norm(model, scope + "/layer_norm") {}
+      };
+
       Embeddings _embeddings;
       Dense _init_state_linear;
       LayerNorm _init_state_ln;
       CGRUDecoderCell _cell;
-      Dense _hidden_linear;
-      LayerNorm _hidden_ln;
+      DenseLN _hidden_embed;
+      DenseLN _hidden_state;
+      DenseLN _hidden_context;
       Dense _output;
       dim_t _dim_rnn;
     };
