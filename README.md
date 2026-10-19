@@ -1,6 +1,25 @@
 [![CI](https://github.com/OpenNMT/CTranslate2/workflows/CI/badge.svg)](https://github.com/OpenNMT/CTranslate2/actions?query=workflow%3ACI) [![PyPI version](https://badge.fury.io/py/ctranslate2.svg)](https://badge.fury.io/py/ctranslate2) [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://opennmt.net/CTranslate2/) [![Gitter](https://badges.gitter.im/OpenNMT/CTranslate2.svg)](https://gitter.im/OpenNMT/CTranslate2?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge) [![Forum](https://img.shields.io/discourse/status?server=https%3A%2F%2Fforum.opennmt.net%2F)](https://forum.opennmt.net/)
 
-# CTranslate2
+# CTranslate2 — Marian `s2s` fork
+
+> **Fork notice.** This repository extends upstream [`OpenNMT/CTranslate2`](https://github.com/OpenNMT/CTranslate2) with support for Marian NMT's RNN sequence-to-sequence models (`type: s2s`): a bi-directional GRU encoder with Bahdanau (additive) attention and a conditional GRU (cGRU) decoder. Upstream CTranslate2 only supports Marian's `transformer` type.
+
+## s2s support status
+
+| Component | Status |
+| --- | --- |
+| `RNNModelSpec` Python spec (`python/ctranslate2/specs/rnn_spec.py`) | **Done** |
+| `RNNModel` factory registration (`src/models/rnn.cc`, `src/models/model_factory.cc`) | **Done** |
+| Marian `s2s` converter path (`python/ctranslate2/converters/marian.py`) with hard guards + Tier-1 Python tests | **Done** |
+| C++ `GRUCell` forward (scale-only LN, Marian `[r | u | c]` gate order) + Tier-2 unit test | **Done** |
+| `BahdanauAttention`, `CGRUDecoderCell`, `BiGRUEncoder`, `RNNDecoder` runtime | **Pending** (stubs throw `std::runtime_error`) |
+| End-to-end parity against Marian on a real `model.npz` | **Pending** |
+
+The converter is runnable today; translation of converted s2s models is **not** yet functional end-to-end. See [`docs/superpowers/plans/2026-10-19-marian-s2s-support.md`](docs/superpowers/plans/2026-10-19-marian-s2s-support.md) for the design, remaining tasks, and verification plan.
+
+Everything below this notice is upstream CTranslate2 documentation and applies unchanged (transformer paths are untouched).
+
+---
 
 CTranslate2 is a C++ and Python library for efficient inference with Transformer models.
 
