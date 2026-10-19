@@ -39,7 +39,15 @@ export LD_LIBRARY_PATH="$CTRANSLATE2_ROOT/lib:$CTRANSLATE2_ROOT/lib64:$LD_LIBRAR
 pip install -e python/
 ```
 
-On CUDA machines pass `-DWITH_CUDA=ON -DWITH_CUDNN=ON` to the first `cmake` and make sure `nvcc` is on `PATH`. On macOS, Apple Accelerate is picked up automatically; replace the `-DWITH_OPENBLAS` flag with `-DWITH_ACCELERATE=ON`.
+You **must** enable exactly one CPU BLAS backend or `translate_batch` fails at runtime with `No SGEMM backend on CPU`. Pick one that your box has:
+
+- `-DWITH_MKL=ON` — fastest on Intel; requires MKL to be discoverable.
+- `-DWITH_OPENBLAS=ON` — Linux with `libopenblas-dev` installed.
+- `-DWITH_DNNL=ON` — Linux with `libdnnl-dev` installed.
+- `-DWITH_RUY=ON` — bundled, no system deps, slower than the above.
+- `-DWITH_ACCELERATE=ON` — macOS, picked up automatically.
+
+Always pair the chosen backend with `-DWITH_MKL=OFF` if MKL is not what you want (it defaults to `ON`). On CUDA machines also pass `-DWITH_CUDA=ON -DWITH_CUDNN=ON` and make sure `nvcc` is on `PATH`.
 
 The converter CLI `ct2-marian-converter` and the Python entry point `ctranslate2.converters.MarianConverter` dispatch on the Marian config's `type:` field — `transformer` goes through the upstream path, `s2s` goes through this fork's new path. Both call `translate_batch` identically from Python.
 
@@ -106,27 +114,57 @@ for src, result in zip(sources, results):
 
 ### Inference (s2s-type)
 
-The s2s path uses the same `ctranslate2.Translator` API as the transformer path. Pre-tokenize with the same SentencePiece/BPE model Marian was trained with (CTranslate2 does not tokenize):
+The s2s path uses the same `ctranslate2.Translator` API as the transformer path. Pre-tokenize with the same tokenizer Marian was trained with — CTranslate2 does not tokenize. Marian recipes typically use **subword-nmt** BPE (text codes starting with `#version:`); some use **SentencePiece** (binary `.model` protobuf).
+
+Match your `beam_size` and `length_penalty` to the Marian config's `beam-size` and `normalize` values for parity.
+
+#### subword-nmt BPE (most Marian recipes)
+
+```bash
+pip install subword-nmt
+```
+
+```python
+import ctranslate2
+from subword_nmt.apply_bpe import BPE
+
+translator = ctranslate2.Translator("ct2_s2s_model", device="cpu")  # or device="cuda"
+
+with open("/path/to/arfr.bpe", encoding="utf-8") as f:
+    bpe = BPE(f)
+
+sources = ["source line 1", "source line 2"]
+source_tokens = [bpe.process_line(s).split() for s in sources]
+
+results = translator.translate_batch(
+    source_tokens,
+    beam_size=12,          # match Marian's beam-size
+    length_penalty=1.0,    # match Marian's normalize
+    max_decoding_length=256,
+)
+
+for src, result in zip(sources, results):
+    hyp = result.hypotheses[0]
+    # subword-nmt detokenization: strip trailing "@@" from each piece then join.
+    detok = " ".join(hyp).replace("@@ ", "").replace("@@", "")
+    print(src, "=>", detok)
+```
+
+#### SentencePiece
 
 ```python
 import ctranslate2
 import sentencepiece as spm
 
-translator = ctranslate2.Translator("ct2_s2s_model", device="cpu")  # or device="cuda"
+translator = ctranslate2.Translator("ct2_s2s_model", device="cpu")
 sp = spm.SentencePieceProcessor(model_file="/path/to/sentencepiece.model")
 
-sources = ["Hello world!", "This is a test."]
+sources = ["source line 1", "source line 2"]
 source_tokens = [sp.encode(s, out_type=str) for s in sources]
 
-results = translator.translate_batch(
-    source_tokens,
-    beam_size=5,
-    max_decoding_length=256,
-)
-
+results = translator.translate_batch(source_tokens, beam_size=12, length_penalty=1.0)
 for src, result in zip(sources, results):
-    hypothesis = result.hypotheses[0]
-    print(src, "=>", sp.decode(hypothesis))
+    print(src, "=>", sp.decode(result.hypotheses[0]))
 ```
 
 To compare against the Marian reference decoder on the same inputs, run `marian-decoder` with the original `model.npz` and the same beam size, then diff the hypotheses:
