@@ -155,6 +155,11 @@ _S2S_HARD_GUARDS = {
 
 def _s2s_require(config, key, expected):
     actual = config.get(key)
+    # Marian treats absent boolean options as their default (False for every
+    # key in _S2S_HARD_GUARDS whose expected value is False). Older yaml
+    # headers omit these keys entirely, so `None` must match `False`.
+    if actual is None and expected is False:
+        return
     if actual != expected:
         raise ValueError(
             "Marian s2s converter: option %r = %r is not supported "

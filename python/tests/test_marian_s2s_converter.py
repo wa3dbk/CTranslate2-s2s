@@ -171,6 +171,29 @@ def test_s2s_guards_reject_unsupported(tmp_path, key, bad_value):
         converter._load()
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "skip",
+        "right-left",
+        "transformer-rnn-projection",
+        "transformer-pool",
+        "ulr",
+        "embedding-fix-src",
+        "embedding-fix-trg",
+    ],
+)
+def test_s2s_guards_accept_absent_boolean_defaulting_to_false(tmp_path, key):
+    # Older Marian model.npz.yml files omit boolean options whose default is
+    # False. `config.get(key)` returns None in that case; the converter must
+    # accept that as equivalent to False rather than raising.
+    config = _s2s_base_config()
+    config.pop(key, None)
+    converter = _make_converter(tmp_path, config)
+    spec = converter._load()
+    assert spec.name == "RNNModelSpec"
+
+
 def test_s2s_unknown_type_errors(tmp_path):
     config = _s2s_base_config()
     config["type"] = "amun"
