@@ -177,12 +177,13 @@ def _s2s_require_empty_list(config, key):
 
 def _s2s_gate_concat(np_u, np_ux):
     """Concat `[W | Wx]` on the last axis preserving gate order
-    `[reset | update | candidate]`.
+    `[reset | update | candidate]`, then transpose to CT2's `[out, in]`.
 
-    Marian's `_U` is `[H, 2H] = [reset | update]`; `_Ux` is `[H, H] = candidate`.
-    Result shape `[H, 3H]`.
+    Marian stores GRU weights as `[in, out]`: `_U` is `[H, 2H] = [reset | update]`
+    and `_Ux` is `[H, H] = candidate`. CT2's `Dense` expects `[out, in]`, so the
+    result is transposed to `[3H, in]`.
     """
-    return np.concatenate([np_u, np_ux], axis=-1)
+    return np.concatenate([np_u, np_ux], axis=-1).T
 
 
 def _s2s_bias_concat(np_b, np_bx):
@@ -225,8 +226,9 @@ def _s2s_load_attention(spec_attn, model, prefix, dim_enc):
     """Populate a `BahdanauAttentionSpec`. `b_att` is stored as the LN *shift*
     on the context side (`ln_context.beta`), not as an affine bias — Marian
     applies it inside `layerNorm(dot(context, Ua_), gammaContext_, ba_)`."""
-    spec_attn.query.weight = model["%s_W_comb_att" % prefix].astype(np.float32)
-    spec_attn.memory.weight = model["%s_Wc_att" % prefix].astype(np.float32)
+    # Marian stores these as `[in, out]`; CT2 Dense expects `[out, in]`.
+    spec_attn.query.weight = model["%s_W_comb_att" % prefix].T.astype(np.float32)
+    spec_attn.memory.weight = model["%s_Wc_att" % prefix].T.astype(np.float32)
     spec_attn.v = model["%s_U_att" % prefix].reshape(-1).astype(np.float32)
     spec_attn.ln_context.gamma = model["%s_att_gamma1" % prefix].reshape(-1).astype(np.float32)
     spec_attn.ln_context.beta = model["%s_b_att" % prefix].reshape(-1).astype(np.float32)
@@ -235,8 +237,11 @@ def _s2s_load_attention(spec_attn, model, prefix, dim_enc):
 
 
 def _s2s_load_dense_ln(spec_dense_ln, model, prefix):
-    """Populate a `DenseLNSpec` from `<prefix>_W/_b/_gamma`."""
-    weight = model["%s_W" % prefix].astype(np.float32)
+    """Populate a `DenseLNSpec` from `<prefix>_W/_b/_gamma`.
+
+    Marian stores `_W` as `[in, out]`; CT2 Dense expects `[out, in]`.
+    """
+    weight = model["%s_W" % prefix].T.astype(np.float32)
     bias = model["%s_b" % prefix].reshape(-1).astype(np.float32)
     gamma = model["%s_gamma" % prefix].reshape(-1).astype(np.float32)
     spec_dense_ln.linear.weight = weight
