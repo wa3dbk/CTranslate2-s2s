@@ -6,6 +6,7 @@ from ctranslate2.specs.model_spec import (
     ModelSpec,
     SequenceToSequenceModelSpec,
 )
+from ctranslate2.specs.rnn_spec import RNNModelSpec
 from ctranslate2.specs.transformer_spec import (
     TransformerDecoderModelSpec,
     TransformerDecoderSpec,

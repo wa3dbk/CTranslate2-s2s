@@ -2,6 +2,7 @@
 
 #include <mutex>
 
+#include "ctranslate2/models/rnn.h"
 #include "ctranslate2/models/whisper.h"
 #include "ctranslate2/models/wav2vec2.h"
 #include "ctranslate2/models/wav2vec2bert.h"
@@ -20,6 +21,8 @@ namespace ctranslate2 {
       register_model<TransformerDecoderModel>("TransformerDecoderSpec");
 
       register_model<TransformerEncoderModel>("TransformerEncoderSpec");
+
+      register_model<RNNModel>("RNNModelSpec");
 
       register_model<WhisperModel>("WhisperSpec");
 
