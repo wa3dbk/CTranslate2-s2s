@@ -194,6 +194,25 @@ def test_s2s_guards_accept_absent_boolean_defaulting_to_false(tmp_path, key):
     assert spec.name == "RNNModelSpec"
 
 
+def test_s2s_tied_embeddings_accept_differing_vocabs(tmp_path):
+    # tied-embeddings-all shares Wemb in id-space, so same-size src/tgt
+    # vocabs with different token content (e.g. bilingual ara/fra) are valid.
+    config = _s2s_base_config()
+    V = config["dim-vocabs"][0]
+    v_src = tmp_path / "vocab.src.yml"
+    v_tgt = tmp_path / "vocab.tgt.yml"
+    with open(v_src, "w") as f:
+        for i in range(V):
+            f.write("src_tok%d: %d\n" % (i, i))
+    with open(v_tgt, "w") as f:
+        for i in range(V):
+            f.write("tgt_tok%d: %d\n" % (i, i))
+    npz = _write_fake_npz(tmp_path, config)
+    converter = MarianConverter(str(npz), [str(v_src), str(v_tgt)])
+    spec = converter._load()
+    assert spec.name == "RNNModelSpec"
+
+
 def test_s2s_unknown_type_errors(tmp_path):
     config = _s2s_base_config()
     config["type"] = "amun"

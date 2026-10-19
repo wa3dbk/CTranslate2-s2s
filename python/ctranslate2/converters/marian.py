@@ -304,12 +304,9 @@ def _build_s2s_spec(config, model, vocabs):
     I = config["dim-emb"]
     V_src, V_tgt = config["dim-vocabs"][0], config["dim-vocabs"][-1]
 
-    # tied-embeddings-all requires identical source and target vocabularies.
-    if len(vocabs) == 2 and vocabs[0] != vocabs[1]:
-        raise ValueError(
-            "Marian s2s converter: tied-embeddings-all=True requires identical "
-            "source and target vocabularies; got mismatched vocab files."
-        )
+    # tied-embeddings-all ties the single Wemb across src/tgt/output in
+    # id-space, so the two vocab files only need to agree on size. Their
+    # token-to-id mappings may differ per side (common in bilingual setups).
     if V_src != V_tgt:
         raise ValueError(
             "Marian s2s converter: tied-embeddings-all=True requires equal "
