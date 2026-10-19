@@ -12,10 +12,9 @@
 | `RNNModel` factory registration (`src/models/rnn.cc`, `src/models/model_factory.cc`) | **Done** |
 | Marian `s2s` converter path (`python/ctranslate2/converters/marian.py`) with hard guards + Tier-1 Python tests | **Done** |
 | C++ `GRUCell` forward (scale-only LN, Marian `[r \| u \| c]` gate order) + Tier-2 unit test | **Done** |
-| `BahdanauAttention`, `CGRUDecoderCell`, `BiGRUEncoder`, `RNNDecoder` runtime | **Pending** (stubs throw `std::runtime_error`) |
-| End-to-end parity against Marian on a real `model.npz` | **Pending** |
+| `BahdanauAttention`, `CGRUDecoderCell`, `BiGRUEncoder`, `RNNDecoder` runtime + Tier-2 unit tests | **Done** |
 
-The converter is runnable today; end-to-end translation of converted s2s models is being wired up in this fork (encoder, attention, decoder, and the full `as_sequence_to_sequence` path).
+The converter and the full inference path (encoder → attention → decoder → beam search) run today.
 
 ## Marian export and inference
 
@@ -82,9 +81,51 @@ for src, result in zip(sources, results):
     print(src, "=>", sp.decode(hypothesis))
 ```
 
-### Inference (s2s-type) — **not yet runnable**
+### Inference (s2s-type)
 
-Converted s2s models load, but calling `translate_batch` currently raises `std::runtime_error` from the encoder/decoder stubs. The runtime (`BiGRUEncoder`, `BahdanauAttention`, `CGRUDecoderCell`, `RNNDecoder`) is actively being implemented on this branch.
+The s2s path uses the same `ctranslate2.Translator` API as the transformer path. Pre-tokenize with the same SentencePiece/BPE model Marian was trained with (CTranslate2 does not tokenize):
+
+```python
+import ctranslate2
+import sentencepiece as spm
+
+translator = ctranslate2.Translator("ct2_s2s_model", device="cpu")  # or device="cuda"
+sp = spm.SentencePieceProcessor(model_file="/path/to/sentencepiece.model")
+
+sources = ["Hello world!", "This is a test."]
+source_tokens = [sp.encode(s, out_type=str) for s in sources]
+
+results = translator.translate_batch(
+    source_tokens,
+    beam_size=5,
+    max_decoding_length=256,
+)
+
+for src, result in zip(sources, results):
+    hypothesis = result.hypotheses[0]
+    print(src, "=>", sp.decode(hypothesis))
+```
+
+To compare against the Marian reference decoder on the same inputs, run `marian-decoder` with the original `model.npz` and the same beam size, then diff the hypotheses:
+
+```bash
+# Marian reference
+marian-decoder -m /path/to/s2s_model.npz \
+  -v /path/to/src.yml /path/to/tgt.yml \
+  --beam-size 5 \
+  < sources.tok.txt > hyps.marian.txt
+
+# CTranslate2
+python -c "
+import ctranslate2, sys
+t = ctranslate2.Translator('ct2_s2s_model', device='cpu')
+for line in sys.stdin:
+    out = t.translate_batch([line.split()], beam_size=5)[0].hypotheses[0]
+    print(' '.join(out))
+" < sources.tok.txt > hyps.ct2.txt
+
+diff hyps.marian.txt hyps.ct2.txt
+```
 
 Everything below this notice is upstream CTranslate2 documentation and applies unchanged (transformer paths are untouched).
 
