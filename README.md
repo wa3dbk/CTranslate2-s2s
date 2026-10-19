@@ -17,6 +17,75 @@
 
 The converter is runnable today; translation of converted s2s models is **not** yet functional end-to-end. See [`docs/superpowers/plans/2026-10-19-marian-s2s-support.md`](docs/superpowers/plans/2026-10-19-marian-s2s-support.md) for the design, remaining tasks, and verification plan.
 
+## Marian export and inference
+
+Install this fork (either `pip install -e python/` from a source checkout, or build and install a wheel). The converter CLI `ct2-marian-converter` and the Python entry point `ctranslate2.converters.MarianConverter` dispatch on the Marian config's `type:` field — `transformer` goes through the upstream path (works end-to-end), `s2s` goes through the new path (converts today, inference pending).
+
+Inputs expected by the converter:
+
+- `model.npz` — Marian weights.
+- One or two vocabularies as `.yml` (joint `--vocab_paths vocab.yml` or separate `--vocab_paths src.yml tgt.yml`). The vocabulary files must match what Marian used during training.
+
+### Export — CLI
+
+```bash
+# Transformer-type Marian (upstream path, fully supported)
+ct2-marian-converter \
+  --model_path /path/to/model.npz \
+  --vocab_paths /path/to/vocab.yml \
+  --output_dir ct2_model \
+  --quantization int8
+
+# s2s-type Marian (this fork's new path)
+ct2-marian-converter \
+  --model_path /path/to/s2s_model.npz \
+  --vocab_paths /path/to/src.yml /path/to/tgt.yml \
+  --output_dir ct2_s2s_model
+```
+
+Common `--quantization` values: `int8`, `int8_float16`, `int16`, `float16`, `bfloat16`, `float32`. Add `--force` to overwrite an existing `--output_dir`.
+
+### Export — Python
+
+```python
+from ctranslate2.converters import MarianConverter
+
+converter = MarianConverter(
+    model_path="/path/to/model.npz",
+    vocab_paths=["/path/to/src.yml", "/path/to/tgt.yml"],
+)
+converter.convert(output_dir="ct2_model", quantization="int8", force=True)
+```
+
+### Inference (transformer-type)
+
+Marian tokenization is **not** performed by CTranslate2 — pre-tokenize with the same SentencePiece/BPE model Marian was trained with, strip or keep BOS/EOS to match the config, then pass token strings to `translate_batch`:
+
+```python
+import ctranslate2
+import sentencepiece as spm
+
+translator = ctranslate2.Translator("ct2_model", device="cpu")  # or device="cuda"
+sp = spm.SentencePieceProcessor(model_file="/path/to/sentencepiece.model")
+
+sources = ["Hello world!", "This is a test."]
+source_tokens = [sp.encode(s, out_type=str) for s in sources]
+
+results = translator.translate_batch(
+    source_tokens,
+    beam_size=5,
+    max_decoding_length=256,
+)
+
+for src, result in zip(sources, results):
+    hypothesis = result.hypotheses[0]
+    print(src, "=>", sp.decode(hypothesis))
+```
+
+### Inference (s2s-type) — **not yet runnable**
+
+Converted s2s models load, but calling `translate_batch` currently raises `std::runtime_error` from the encoder/decoder stubs. Track remaining work in [`docs/superpowers/plans/2026-10-19-marian-s2s-support.md`](docs/superpowers/plans/2026-10-19-marian-s2s-support.md).
+
 Everything below this notice is upstream CTranslate2 documentation and applies unchanged (transformer paths are untouched).
 
 ---
