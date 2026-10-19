@@ -8,7 +8,7 @@ import yaml
 
 from ctranslate2.converters import utils
 from ctranslate2.converters.converter import Converter
-from ctranslate2.specs import common_spec, transformer_spec
+from ctranslate2.specs import common_spec, rnn_spec, transformer_spec
 
 _SUPPORTED_ACTIVATIONS = {
     "gelu": common_spec.Activation.GELUSigmoid,
@@ -37,75 +37,310 @@ class MarianConverter(Converter):
         config = _get_model_config(model)
         vocabs = list(map(load_vocab, self._vocab_paths))
 
-        activation = config["transformer-ffn-activation"]
-        pre_norm = "n" in config["transformer-preprocess"]
-        postprocess_emb = config["transformer-postprocess-emb"]
-
-        check = utils.ConfigurationChecker()
-        check(config["type"] == "transformer", "Option --type must be 'transformer'")
-        check(
-            config["transformer-decoder-autoreg"] == "self-attention",
-            "Option --transformer-decoder-autoreg must be 'self-attention'",
-        )
-        check(
-            not config["transformer-no-projection"],
-            "Option --transformer-no-projection is not supported",
-        )
-        check(
-            activation in _SUPPORTED_ACTIVATIONS,
-            "Option --transformer-ffn-activation %s is not supported "
-            "(supported activations are: %s)"
-            % (activation, ", ".join(_SUPPORTED_ACTIVATIONS.keys())),
-        )
-        check(
-            postprocess_emb in _SUPPORTED_POSTPROCESS_EMB,
-            "Option --transformer-postprocess-emb %s is not supported (supported values are: %s)"
-            % (postprocess_emb, ", ".join(_SUPPORTED_POSTPROCESS_EMB)),
-        )
-
-        if pre_norm:
-            check(
-                config["transformer-preprocess"] == "n"
-                and config["transformer-postprocess"] == "da"
-                and config.get("transformer-postprocess-top", "") == "n",
-                "Unsupported pre-norm Transformer architecture, expected the following "
-                "combination of options: "
-                "--transformer-preprocess n "
-                "--transformer-postprocess da "
-                "--transformer-postprocess-top n",
+        model_type = config.get("type")
+        if model_type == "s2s":
+            return _build_s2s_spec(config, model, vocabs)
+        elif model_type != "transformer":
+            raise NotImplementedError(
+                "Marian model type %r is not supported; "
+                "supported types: 'transformer', 's2s'" % model_type
             )
-        else:
-            check(
-                config["transformer-preprocess"] == ""
-                and config["transformer-postprocess"] == "dan"
-                and config.get("transformer-postprocess-top", "") == "",
-                "Unsupported post-norm Transformer architecture, excepted the following "
-                "combination of options: "
-                "--transformer-preprocess '' "
-                "--transformer-postprocess dan "
-                "--transformer-postprocess-top ''",
-            )
+        return _build_transformer_spec(config, model, vocabs)
 
-        check.validate()
 
-        alignment_layer = config["transformer-guided-alignment-layer"]
-        alignment_layer = -1 if alignment_layer == "last" else int(alignment_layer) - 1
-        layernorm_embedding = "n" in postprocess_emb
+def _build_transformer_spec(config, model, vocabs):
+    activation = config["transformer-ffn-activation"]
+    pre_norm = "n" in config["transformer-preprocess"]
+    postprocess_emb = config["transformer-postprocess-emb"]
 
-        model_spec = transformer_spec.TransformerSpec.from_config(
-            (config["enc-depth"], config["dec-depth"]),
-            config["transformer-heads"],
-            pre_norm=pre_norm,
-            activation=_SUPPORTED_ACTIVATIONS[activation],
-            alignment_layer=alignment_layer,
-            alignment_heads=1,
-            layernorm_embedding=layernorm_embedding,
+    check = utils.ConfigurationChecker()
+    check(config["type"] == "transformer", "Option --type must be 'transformer'")
+    check(
+        config["transformer-decoder-autoreg"] == "self-attention",
+        "Option --transformer-decoder-autoreg must be 'self-attention'",
+    )
+    check(
+        not config["transformer-no-projection"],
+        "Option --transformer-no-projection is not supported",
+    )
+    check(
+        activation in _SUPPORTED_ACTIVATIONS,
+        "Option --transformer-ffn-activation %s is not supported "
+        "(supported activations are: %s)"
+        % (activation, ", ".join(_SUPPORTED_ACTIVATIONS.keys())),
+    )
+    check(
+        postprocess_emb in _SUPPORTED_POSTPROCESS_EMB,
+        "Option --transformer-postprocess-emb %s is not supported (supported values are: %s)"
+        % (postprocess_emb, ", ".join(_SUPPORTED_POSTPROCESS_EMB)),
+    )
+
+    if pre_norm:
+        check(
+            config["transformer-preprocess"] == "n"
+            and config["transformer-postprocess"] == "da"
+            and config.get("transformer-postprocess-top", "") == "n",
+            "Unsupported pre-norm Transformer architecture, expected the following "
+            "combination of options: "
+            "--transformer-preprocess n "
+            "--transformer-postprocess da "
+            "--transformer-postprocess-top n",
         )
-        set_transformer_spec(model_spec, model)
-        model_spec.register_source_vocabulary(vocabs[0])
-        model_spec.register_target_vocabulary(vocabs[-1])
-        model_spec.config.add_source_eos = True
-        return model_spec
+    else:
+        check(
+            config["transformer-preprocess"] == ""
+            and config["transformer-postprocess"] == "dan"
+            and config.get("transformer-postprocess-top", "") == "",
+            "Unsupported post-norm Transformer architecture, excepted the following "
+            "combination of options: "
+            "--transformer-preprocess '' "
+            "--transformer-postprocess dan "
+            "--transformer-postprocess-top ''",
+        )
+
+    check.validate()
+
+    alignment_layer = config["transformer-guided-alignment-layer"]
+    alignment_layer = -1 if alignment_layer == "last" else int(alignment_layer) - 1
+    layernorm_embedding = "n" in postprocess_emb
+
+    model_spec = transformer_spec.TransformerSpec.from_config(
+        (config["enc-depth"], config["dec-depth"]),
+        config["transformer-heads"],
+        pre_norm=pre_norm,
+        activation=_SUPPORTED_ACTIVATIONS[activation],
+        alignment_layer=alignment_layer,
+        alignment_heads=1,
+        layernorm_embedding=layernorm_embedding,
+    )
+    set_transformer_spec(model_spec, model)
+    model_spec.register_source_vocabulary(vocabs[0])
+    model_spec.register_target_vocabulary(vocabs[-1])
+    model_spec.config.add_source_eos = True
+    return model_spec
+
+
+# ----------------------------------------------------------------------------
+# Marian s2s (RNN encoder-decoder) builder.
+#
+# This path targets a single configuration: single bi-GRU encoder, cGRU decoder
+# (`dec-cell-base-depth: 2`), layer-norm on, `tied-embeddings-all: True`.
+# Anything outside this set is rejected at convert time with a `ValueError`
+# naming the offending option. See `README_s2s.md` for the full scope.
+# ----------------------------------------------------------------------------
+
+
+_S2S_HARD_GUARDS = {
+    "enc-depth": 1,
+    "enc-cell-depth": 1,
+    "enc-type": "bidirectional",
+    "enc-cell": "gru",
+    "dec-depth": 1,
+    "dec-cell": "gru",
+    "dec-cell-base-depth": 2,
+    "dec-cell-high-depth": 1,
+    "skip": False,
+    "layer-normalization": True,
+    "tied-embeddings-all": True,
+    "right-left": False,
+    "factors-dim-emb": 0,
+    "lemma-dim-emb": 0,
+    "transformer-rnn-projection": False,
+    "transformer-pool": False,
+    "ulr": False,
+    "embedding-fix-src": False,
+    "embedding-fix-trg": False,
+}
+
+
+def _s2s_require(config, key, expected):
+    actual = config.get(key)
+    if actual != expected:
+        raise ValueError(
+            "Marian s2s converter: option %r = %r is not supported "
+            "(this converter currently requires %r = %r). "
+            "File an issue with your model.npz.yml if you need this variant."
+            % (key, actual, key, expected)
+        )
+
+
+def _s2s_require_empty_list(config, key):
+    actual = config.get(key, [])
+    if actual not in ([], None):
+        raise ValueError(
+            "Marian s2s converter: option %r = %r is not supported "
+            "(this converter requires it to be empty). "
+            "File an issue with your model.npz.yml if you need this variant."
+            % (key, actual)
+        )
+
+
+def _s2s_gate_concat(np_u, np_ux):
+    """Concat `[W | Wx]` on the last axis preserving gate order
+    `[reset | update | candidate]`.
+
+    Marian's `_U` is `[H, 2H] = [reset | update]`; `_Ux` is `[H, H] = candidate`.
+    Result shape `[H, 3H]`.
+    """
+    return np.concatenate([np_u, np_ux], axis=-1)
+
+
+def _s2s_bias_concat(np_b, np_bx):
+    """Marian stores GRU bias as `_b` ([1, 2H]) and `_bx` ([1, H]). CTranslate2
+    `LinearSpec` stores a 1-D bias. Returns a flat `[3H]` array."""
+    return np.concatenate([np_b.reshape(-1), np_bx.reshape(-1)], axis=0)
+
+
+def _s2s_load_cell(spec_cell, model, prefix, dim_rnn):
+    """Populate a `GRUCellSpec` from Marian tensors under `<prefix>_...`."""
+    H = dim_rnn
+    U = model["%s_U" % prefix]
+    Ux = model["%s_Ux" % prefix]
+    if U.shape[-1] != 2 * H:
+        raise ValueError(
+            "Marian s2s converter: tensor %s_U has last-axis size %d, expected %d"
+            % (prefix, U.shape[-1], 2 * H)
+        )
+    if Ux.shape[-1] != H:
+        raise ValueError(
+            "Marian s2s converter: tensor %s_Ux has last-axis size %d, expected %d"
+            % (prefix, Ux.shape[-1], H)
+        )
+    spec_cell.recurrent.weight = _s2s_gate_concat(U, Ux).astype(np.float32)
+    # Recurrent side has no bias — bias is fused on the input side.
+    spec_cell.ln_recurrent.gamma = model["%s_gamma2" % prefix].reshape(-1).astype(np.float32)
+    spec_cell.ln_recurrent.beta = np.zeros(3 * H, dtype=np.float32)
+
+    W = model["%s_W" % prefix]
+    Wx = model["%s_Wx" % prefix]
+    b = model["%s_b" % prefix]
+    bx = model["%s_bx" % prefix]
+    spec_cell.input.weight = _s2s_gate_concat(W, Wx).astype(np.float32)
+    spec_cell.input.bias = _s2s_bias_concat(b, bx).astype(np.float32)
+    spec_cell.ln_input.gamma = model["%s_gamma1" % prefix].reshape(-1).astype(np.float32)
+    spec_cell.ln_input.beta = np.zeros(3 * H, dtype=np.float32)
+
+
+def _s2s_load_attention(spec_attn, model, prefix, dim_enc):
+    """Populate a `BahdanauAttentionSpec`. `b_att` is stored as the LN *shift*
+    on the context side (`ln_context.beta`), not as an affine bias — Marian
+    applies it inside `layerNorm(dot(context, Ua_), gammaContext_, ba_)`."""
+    spec_attn.query.weight = model["%s_W_comb_att" % prefix].astype(np.float32)
+    spec_attn.memory.weight = model["%s_Wc_att" % prefix].astype(np.float32)
+    spec_attn.v = model["%s_U_att" % prefix].reshape(-1).astype(np.float32)
+    spec_attn.ln_context.gamma = model["%s_att_gamma1" % prefix].reshape(-1).astype(np.float32)
+    spec_attn.ln_context.beta = model["%s_b_att" % prefix].reshape(-1).astype(np.float32)
+    spec_attn.ln_state.gamma = model["%s_att_gamma2" % prefix].reshape(-1).astype(np.float32)
+    spec_attn.ln_state.beta = np.zeros(dim_enc, dtype=np.float32)
+
+
+def _s2s_load_dense_ln(spec_dense_ln, model, prefix):
+    """Populate a `DenseLNSpec` from `<prefix>_W/_b/_gamma`."""
+    weight = model["%s_W" % prefix].astype(np.float32)
+    bias = model["%s_b" % prefix].reshape(-1).astype(np.float32)
+    gamma = model["%s_gamma" % prefix].reshape(-1).astype(np.float32)
+    spec_dense_ln.linear.weight = weight
+    spec_dense_ln.linear.bias = bias
+    spec_dense_ln.layer_norm.gamma = gamma
+    spec_dense_ln.layer_norm.beta = np.zeros_like(gamma)
+
+
+def _s2s_expected_tensor_names():
+    """The exact set of NPZ tensor names this converter consumes."""
+    names = {"Wemb", "special:model.yml"}
+    for prefix in ("encoder_bi", "encoder_bi_r", "decoder_cell1", "decoder_cell2"):
+        for sfx in ("_U", "_Ux", "_W", "_Wx", "_b", "_bx", "_gamma1", "_gamma2"):
+            names.add(prefix + sfx)
+    for sfx in ("_W_comb_att", "_Wc_att", "_U_att", "_b_att",
+                "_att_gamma1", "_att_gamma2"):
+        names.add("decoder" + sfx)
+    for prefix in ("decoder_ff_state", "decoder_ff_logit_l1"):
+        for sfx in ("_W", "_b", "_gamma"):
+            names.add(prefix + sfx)
+    names.add("decoder_ff_logit_l2_b")
+    return names
+
+
+_S2S_IGNORABLE_TENSOR_NAMES = {
+    # Non-weight metadata keys that may appear in the NPZ.
+    "special:model.yml",
+    # Training-only state kept for backwards compatibility.
+    "Wpos",
+}
+
+
+def _s2s_validate_tensor_set(model):
+    expected = _s2s_expected_tensor_names()
+    present = set(model.files)
+    missing = expected - present
+    if missing:
+        raise ValueError(
+            "Marian s2s converter: missing expected tensor(s): %s" % sorted(missing)
+        )
+    extra = present - expected - _S2S_IGNORABLE_TENSOR_NAMES
+    if extra:
+        raise ValueError(
+            "Marian s2s converter: unused tensor(s) in NPZ (unknown to this "
+            "converter): %s" % sorted(extra)
+        )
+
+
+def _build_s2s_spec(config, model, vocabs):
+    for key, expected in _S2S_HARD_GUARDS.items():
+        _s2s_require(config, key, expected)
+    _s2s_require_empty_list(config, "input-types")
+
+    H = config["dim-rnn"]
+    I = config["dim-emb"]
+    V_src, V_tgt = config["dim-vocabs"][0], config["dim-vocabs"][-1]
+
+    # tied-embeddings-all requires identical source and target vocabularies.
+    if len(vocabs) == 2 and vocabs[0] != vocabs[1]:
+        raise ValueError(
+            "Marian s2s converter: tied-embeddings-all=True requires identical "
+            "source and target vocabularies; got mismatched vocab files."
+        )
+    if V_src != V_tgt:
+        raise ValueError(
+            "Marian s2s converter: tied-embeddings-all=True requires equal "
+            "source and target vocabulary sizes; got %d and %d." % (V_src, V_tgt)
+        )
+
+    spec = rnn_spec.RNNModelSpec()
+
+    Wemb = model["Wemb"]
+    if Wemb.shape != (V_src, I):
+        raise ValueError(
+            "Marian s2s converter: Wemb shape %s != expected (%d, %d)"
+            % (Wemb.shape, V_src, I)
+        )
+    Wemb_f32 = Wemb.astype(np.float32)
+    spec.encoder.embeddings.weight = Wemb_f32
+    spec.decoder.embeddings.weight = Wemb_f32  # tied; aliased by LayerSpec.optimize
+
+    _s2s_load_cell(spec.encoder.forward_cell,  model, "encoder_bi",   dim_rnn=H)
+    _s2s_load_cell(spec.encoder.backward_cell, model, "encoder_bi_r", dim_rnn=H)
+
+    _s2s_load_cell(spec.decoder.cell.gru1, model, "decoder_cell1", dim_rnn=H)
+    _s2s_load_cell(spec.decoder.cell.gru2, model, "decoder_cell2", dim_rnn=H)
+
+    _s2s_load_attention(spec.decoder.cell.attention, model, "decoder", dim_enc=2 * H)
+
+    _s2s_load_dense_ln(spec.decoder.init_state, model, "decoder_ff_state")
+    _s2s_load_dense_ln(spec.decoder.hidden,     model, "decoder_ff_logit_l1")
+
+    # Deep-output top layer: Wt is tied-transposed to Wemb; only the bias is
+    # independent in Marian. The spec stores the tied weight here; LayerSpec
+    # aliasing collapses it with the shared embedding at save time.
+    spec.decoder.output.weight = Wemb_f32
+    spec.decoder.output.bias = model["decoder_ff_logit_l2_b"].reshape(-1).astype(np.float32)
+
+    _s2s_validate_tensor_set(model)
+
+    spec.register_source_vocabulary(vocabs[0])
+    spec.register_target_vocabulary(vocabs[-1])
+    spec.config.add_source_eos = True
+    return spec
 
 
 def _get_model_config(model):
