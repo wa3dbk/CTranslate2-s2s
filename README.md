@@ -15,7 +15,7 @@
 | `BahdanauAttention`, `CGRUDecoderCell`, `BiGRUEncoder`, `RNNDecoder` runtime | **Pending** (stubs throw `std::runtime_error`) |
 | End-to-end parity against Marian on a real `model.npz` | **Pending** |
 
-The converter is runnable today; translation of converted s2s models is **not** yet functional end-to-end. See [`docs/superpowers/plans/2026-10-19-marian-s2s-support.md`](docs/superpowers/plans/2026-10-19-marian-s2s-support.md) for the design, remaining tasks, and verification plan.
+The converter is runnable today; end-to-end translation of converted s2s models is being wired up in this fork (encoder, attention, decoder, and the full `as_sequence_to_sequence` path).
 
 ## Marian export and inference
 
@@ -84,7 +84,7 @@ for src, result in zip(sources, results):
 
 ### Inference (s2s-type) — **not yet runnable**
 
-Converted s2s models load, but calling `translate_batch` currently raises `std::runtime_error` from the encoder/decoder stubs. Track remaining work in [`docs/superpowers/plans/2026-10-19-marian-s2s-support.md`](docs/superpowers/plans/2026-10-19-marian-s2s-support.md).
+Converted s2s models load, but calling `translate_batch` currently raises `std::runtime_error` from the encoder/decoder stubs. The runtime (`BiGRUEncoder`, `BahdanauAttention`, `CGRUDecoderCell`, `RNNDecoder`) is actively being implemented on this branch.
 
 Everything below this notice is upstream CTranslate2 documentation and applies unchanged (transformer paths are untouched).
 
