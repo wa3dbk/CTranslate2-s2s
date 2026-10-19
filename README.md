@@ -11,7 +11,7 @@
 | `RNNModelSpec` Python spec (`python/ctranslate2/specs/rnn_spec.py`) | **Done** |
 | `RNNModel` factory registration (`src/models/rnn.cc`, `src/models/model_factory.cc`) | **Done** |
 | Marian `s2s` converter path (`python/ctranslate2/converters/marian.py`) with hard guards + Tier-1 Python tests | **Done** |
-| C++ `GRUCell` forward (scale-only LN, Marian `[r | u | c]` gate order) + Tier-2 unit test | **Done** |
+| C++ `GRUCell` forward (scale-only LN, Marian `[r \| u \| c]` gate order) + Tier-2 unit test | **Done** |
 | `BahdanauAttention`, `CGRUDecoderCell`, `BiGRUEncoder`, `RNNDecoder` runtime | **Pending** (stubs throw `std::runtime_error`) |
 | End-to-end parity against Marian on a real `model.npz` | **Pending** |
 
