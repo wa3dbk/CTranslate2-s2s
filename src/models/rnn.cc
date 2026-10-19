@@ -8,7 +8,7 @@ namespace ctranslate2 {
   namespace models {
 
     size_t RNNModel::current_spec_revision() const {
-      return 1;
+      return 2;
     }
 
     void RNNModel::initialize(ModelReader& model_reader) {
