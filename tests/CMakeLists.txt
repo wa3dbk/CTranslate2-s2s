@@ -10,6 +10,7 @@ add_executable(ctranslate2_test
   decoding_test.cc
   layers_test.cc
   model_test.cc
+  rnn_test.cc
   storage_view_test.cc
   ops_test.cc
   primitives_test.cc

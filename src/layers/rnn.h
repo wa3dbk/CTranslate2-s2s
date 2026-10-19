@@ -40,7 +40,7 @@ namespace ctranslate2 {
       std::unique_ptr<LayerNorm> _ln_input;
       Dense _recurrent_dense;
       std::unique_ptr<LayerNorm> _ln_recurrent;
-      bool _final;
+      [[maybe_unused]] bool _final;
       dim_t _dim_state;
     };
 

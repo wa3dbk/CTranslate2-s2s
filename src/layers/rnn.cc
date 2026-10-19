@@ -31,10 +31,69 @@ namespace ctranslate2 {
       return _dim_state;
     }
 
-    void GRUCell::operator()(const StorageView* /*input*/,
-                             const StorageView& /*prev_state*/,
-                             StorageView& /*new_state*/) const {
-      throw std::runtime_error("GRUCell::operator() not implemented yet");
+    void GRUCell::operator()(const StorageView* input,
+                             const StorageView& prev_state,
+                             StorageView& new_state) const {
+      const Device device = prev_state.device();
+      const DataType dtype = prev_state.dtype();
+      const dim_t H = _dim_state;
+
+      // Recurrent projection: [B, H] -> [B, 3H], then scale-only LN. Split
+      // last axis into (rs, us, cs) by the Marian gate order [r | u | c].
+      StorageView s_proj(dtype, device);
+      _recurrent_dense(prev_state, s_proj);
+      if (_ln_recurrent)
+        (*_ln_recurrent)(s_proj, s_proj);
+      StorageView rs(dtype, device), us(dtype, device), cs(dtype, device);
+      ops::Split(-1, std::vector<dim_t>{H, H, H})(s_proj, rs, us, cs);
+
+      // Input projection (if any): [B, Dx] -> [B, 3H], then scale-only LN.
+      StorageView rx(dtype, device), ux(dtype, device), cx(dtype, device);
+      const bool has_input = static_cast<bool>(_input_dense);
+      if (has_input) {
+        if (!input)
+          throw std::invalid_argument(
+              "GRUCell with an input side requires a non-null input tensor");
+        StorageView x_proj(dtype, device);
+        (*_input_dense)(*input, x_proj);
+        if (_ln_input)
+          (*_ln_input)(x_proj, x_proj);
+        ops::Split(-1, std::vector<dim_t>{H, H, H})(x_proj, rx, ux, cx);
+      }
+
+      // Pre-activations: pre_r = rx + rs; pre_u = ux + us. When has_input is
+      // false the pre-activations are just the recurrent slices.
+      StorageView pre_r(dtype, device), pre_u(dtype, device);
+      if (has_input) {
+        ops::Add()(rx, rs, pre_r);
+        ops::Add()(ux, us, pre_u);
+      } else {
+        pre_r = std::move(rs);
+        pre_u = std::move(us);
+      }
+      StorageView r(dtype, device), u(dtype, device);
+      ops::Sigmoid()(pre_r, r);
+      ops::Sigmoid()(pre_u, u);
+
+      // Candidate: c = tanh(cx + r * cs). Without an input side the candidate
+      // reduces to tanh(r * cs).
+      StorageView r_cs(dtype, device);
+      ops::Mul()(r, cs, r_cs);
+      StorageView pre_c(dtype, device);
+      if (has_input)
+        ops::Add()(cx, r_cs, pre_c);
+      else
+        pre_c = std::move(r_cs);
+      StorageView c(dtype, device);
+      ops::Tanh()(pre_c, c);
+
+      // new_state = u * prev + (1 - u) * c, computed as c + u * (prev - c)
+      // because Sub's scalar-on-left overload is not available for tensors.
+      StorageView diff(dtype, device);
+      ops::Sub()(prev_state, c, diff);
+      StorageView weighted(dtype, device);
+      ops::Mul()(u, diff, weighted);
+      ops::Add()(c, weighted, new_state);
     }
 
 
