@@ -1,6 +1,10 @@
 #include "rnn.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "ctranslate2/decoding_utils.h"
@@ -10,6 +14,56 @@ namespace ctranslate2 {
   namespace layers {
 
     namespace {
+
+      // Env-var-gated NaN/Inf detector. Enable with `CT2_S2S_DEBUG=1`.
+      // Prints shape, finite min/max, NaN/Inf counts, and first-5 values.
+      // CPU-only (moves to CPU if needed).
+      static bool s2s_debug_enabled() {
+        static const bool enabled = std::getenv("CT2_S2S_DEBUG") != nullptr;
+        return enabled;
+      }
+
+      static void probe(const char* tag, const StorageView& t) {
+        if (!s2s_debug_enabled()) return;
+        if (t.empty()) {
+          std::fprintf(stderr, "[s2s_probe] %s: <empty>\n", tag);
+          return;
+        }
+        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
+        if (host.dtype() != DataType::FLOAT32) {
+          std::fprintf(stderr, "[s2s_probe] %s: dtype=%d (skipped)\n",
+                       tag, static_cast<int>(host.dtype()));
+          return;
+        }
+        const float* d = host.data<float>();
+        const dim_t n = host.size();
+        dim_t nan_count = 0, inf_count = 0;
+        float fmin = 0.0f, fmax = 0.0f;
+        bool have_finite = false;
+        for (dim_t i = 0; i < n; ++i) {
+          const float v = d[i];
+          if (std::isnan(v)) { ++nan_count; continue; }
+          if (std::isinf(v)) { ++inf_count; continue; }
+          if (!have_finite) { fmin = fmax = v; have_finite = true; }
+          else { if (v < fmin) fmin = v; if (v > fmax) fmax = v; }
+        }
+        std::string shape_s;
+        for (dim_t i = 0; i < host.rank(); ++i) {
+          shape_s += (i ? "x" : "") + std::to_string(host.dim(i));
+        }
+        std::fprintf(stderr,
+                     "[s2s_probe] %s shape=%s n=%lld nan=%lld inf=%lld "
+                     "min=%g max=%g head=[%g %g %g %g %g]\n",
+                     tag, shape_s.c_str(),
+                     (long long)n, (long long)nan_count, (long long)inf_count,
+                     have_finite ? fmin : 0.0f,
+                     have_finite ? fmax : 0.0f,
+                     n > 0 ? d[0] : 0.0f,
+                     n > 1 ? d[1] : 0.0f,
+                     n > 2 ? d[2] : 0.0f,
+                     n > 3 ? d[3] : 0.0f,
+                     n > 4 ? d[4] : 0.0f);
+      }
 
       // Build a float mask `[B, 1]` where entry b is 1.0 if `t < lengths[b]`,
       // else 0.0. `lengths` is a 1-D int32 tensor on the same device as the
@@ -112,10 +166,14 @@ namespace ctranslate2 {
 
       // Recurrent projection: [B, H] -> [B, 3H], then scale-only LN. Split
       // last axis into (rs, us, cs) by the Marian gate order [r | u | c].
+      probe("gru:prev_state", prev_state);
       StorageView s_proj(dtype, device);
       _recurrent_dense(prev_state, s_proj);
-      if (_ln_recurrent)
+      probe("gru:recurrent_proj", s_proj);
+      if (_ln_recurrent) {
         (*_ln_recurrent)(s_proj, s_proj);
+        probe("gru:recurrent_proj_ln", s_proj);
+      }
       StorageView rs(dtype, device), us(dtype, device), cs(dtype, device);
       ops::Split(-1, std::vector<dim_t>{H, H, H})(s_proj, rs, us, cs);
 
@@ -126,10 +184,14 @@ namespace ctranslate2 {
         if (!input)
           throw std::invalid_argument(
               "GRUCell with an input side requires a non-null input tensor");
+        probe("gru:input", *input);
         StorageView x_proj(dtype, device);
         (*_input_dense)(*input, x_proj);
-        if (_ln_input)
+        probe("gru:input_proj", x_proj);
+        if (_ln_input) {
           (*_ln_input)(x_proj, x_proj);
+          probe("gru:input_proj_ln", x_proj);
+        }
         ops::Split(-1, std::vector<dim_t>{H, H, H})(x_proj, rx, ux, cx);
       }
 
@@ -166,6 +228,7 @@ namespace ctranslate2 {
       StorageView weighted(dtype, device);
       ops::Mul()(u, diff, weighted);
       ops::Add()(c, weighted, new_state);
+      probe("gru:new_state", new_state);
     }
 
 
@@ -195,9 +258,12 @@ namespace ctranslate2 {
       // along the last axis with `b_att` as the shift (beta).
       const Device device = memory.device();
       const DataType dtype = _memory_dense.output_type();
+      probe("attn:memory_in", memory);
       StorageView proj(dtype, device);
       _memory_dense(memory, proj);
+      probe("attn:memory_proj", proj);
       _ln_context(proj, projected_memory);
+      probe("attn:memory_proj_ln", projected_memory);
     }
 
     void BahdanauAttention::compute(const StorageView& query,
@@ -267,8 +333,14 @@ namespace ctranslate2 {
       energy_flat.reshape(Shape{Bq, S});
       StorageView energy = std::move(energy_flat);
 
+      probe("attn:query", query);
+      probe("attn:q_proj_ln", q);
+      probe("attn:pre_tanh", pre);
+      probe("attn:act", act);
+      probe("attn:energy", energy);
       // Masked softmax along time axis.
       ops::SoftMax()(energy, lengths_ptr, alignment);  // [Bq, S]
+      probe("attn:alignment", alignment);
 
       // Context: alignment [Bq, S] * memory [Bq, S, E_mem] -> [Bq, E_mem].
       // Compute as [Bq, 1, S] × [Bq, S, E_mem] -> [Bq, 1, E_mem] -> squeeze.
@@ -279,6 +351,7 @@ namespace ctranslate2 {
       ops::MatMul()(align_row, *mem_ptr, ctx3);  // [Bq, 1, E_mem]
       ctx3.reshape(Shape{Bq, E_mem});
       context = std::move(ctx3);
+      probe("attn:context", context);
     }
 
 
@@ -355,6 +428,7 @@ namespace ctranslate2 {
       // Embed ids [B, S] -> [B, S, E].
       StorageView emb(dtype, device);
       _embeddings(token_ids, emb);
+      probe("enc:src_emb", emb);
 
       // Forward pass: h_fwd[-1] = 0.
       StorageView h_fwd_prev(Shape{B, H}, dtype, device);
@@ -411,6 +485,7 @@ namespace ctranslate2 {
       for (auto& s : stacked)
         stacked_ptrs.push_back(&s);
       ops::Concat(1)(stacked_ptrs, output);  // [B, S, 2H]
+      probe("enc:output", output);
 
       // Zero out padded positions in the output (match TransformerEncoder's
       // post-padding semantics).
@@ -511,16 +586,20 @@ namespace ctranslate2 {
         mean_pool_memory(memory_cpu, lengths_cpu, pooled);
         if (device != Device::CPU)
           pooled = pooled.to(device);
+        probe("init:pooled", pooled);
 
         // Marian's `ff_state` is `tanh(LN(dot(x, W), gamma, b))`. Without
         // the tanh, the initial hidden state is unbounded and the decoder's
         // GRU gates get driven to saturation on step 0.
         StorageView h0(output_type(), device);
         _init_state_linear(pooled, h0);
+        probe("init:h0_linear", h0);
         StorageView h0_norm(output_type(), device);
         _init_state_ln(h0, h0_norm);
+        probe("init:h0_ln", h0_norm);
         StorageView h0_act(output_type(), device);
         ops::Tanh()(h0_norm, h0_act);
+        probe("init:h0_tanh", h0_act);
         hidden = std::move(h0_act);
 
         // Replicate to match the current (possibly beam-expanded) batch size.
@@ -546,6 +625,11 @@ namespace ctranslate2 {
       // Embed ids [B] -> [B, E]. The Embeddings op accepts [B] and returns [B, E].
       StorageView embed(dtype, device);
       _embeddings(ids, embed);
+      if (s2s_debug_enabled()) {
+        std::fprintf(stderr, "[s2s_probe] === step=%lld ===\n", (long long)step);
+      }
+      probe("dec:tgt_ids", ids);
+      probe("dec:tgt_emb", embed);
 
       // On the first step, lazily build "projected_memory" and "hidden".
       const dim_t B = embed.dim(0);
@@ -559,11 +643,16 @@ namespace ctranslate2 {
       StorageView& projected_memory = state.at("projected_memory");
       StorageView& prev_hidden = state.at("hidden");
 
+      probe("dec:prev_hidden", prev_hidden);
+      probe("dec:projected_memory", projected_memory);
       StorageView new_hidden(dtype, device);
       StorageView context(dtype, device);
       StorageView alignment(dtype, device);
       _cell(embed, prev_hidden, projected_memory, memory, memory_lengths,
             new_hidden, context, alignment);
+      probe("dec:new_hidden", new_hidden);
+      probe("dec:context", context);
+      probe("dec:alignment", alignment);
 
       // Deep-output: Marian builds `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))`
       // where `i` iterates over (embeddings, decoder hidden, aligned context).
@@ -573,29 +662,39 @@ namespace ctranslate2 {
       {
         StorageView proj(dtype, device);
         _hidden_embed.linear(embed, proj);
+        probe("deepout:proj_embed_linear", proj);
         _hidden_embed.layer_norm(proj, y0);
+        probe("deepout:proj_embed_ln", y0);
       }
       StorageView y1(dtype, device);
       {
         StorageView proj(dtype, device);
         _hidden_state.linear(new_hidden, proj);
+        probe("deepout:proj_state_linear", proj);
         _hidden_state.layer_norm(proj, y1);
+        probe("deepout:proj_state_ln", y1);
       }
       StorageView y2(dtype, device);
       {
         StorageView proj(dtype, device);
         _hidden_context.linear(context, proj);
+        probe("deepout:proj_context_linear", proj);
         _hidden_context.layer_norm(proj, y2);
+        probe("deepout:proj_context_ln", y2);
       }
       StorageView sum01(dtype, device);
       ops::Add()(y0, y1, sum01);
       StorageView sum012(dtype, device);
       ops::Add()(sum01, y2, sum012);
+      probe("deepout:sum", sum012);
       StorageView h_tilde(dtype, device);
       ops::Tanh()(sum012, h_tilde);
+      probe("deepout:h_tilde", h_tilde);
 
-      if (logits)
+      if (logits) {
         _output(h_tilde, *logits);
+        probe("dec:logits", *logits);
+      }
 
       if (attention) {
         // Single-step decoder contract: `[B, S]`. BeamSearch's greedy path
