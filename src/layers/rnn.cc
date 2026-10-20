@@ -598,10 +598,11 @@ namespace ctranslate2 {
         _output(h_tilde, *logits);
 
       if (attention) {
-        // Expose [B, 1, S] layout to match the standard decoder convention.
-        StorageView align_out = alignment;
-        align_out.expand_dims(1);  // [B, 1, S]
-        *attention = std::move(align_out);
+        // Single-step decoder contract: `[B, S]`. BeamSearch's greedy path
+        // indexes `{i, 0}` on this tensor; a rank-3 `[B, 1, S]` would raise
+        // "number of indexed dimensions (2) does not match the storage rank
+        // (3)" at decoding.cc. The beam path later expand_dims it back up.
+        *attention = std::move(alignment);
       }
 
       state["hidden"] = std::move(new_hidden);
