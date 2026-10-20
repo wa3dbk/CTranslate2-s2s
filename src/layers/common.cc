@@ -1,6 +1,8 @@
 #include "ctranslate2/layers/common.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "ctranslate2/ops/activation.h"
 #include "cpu/backend.h"
@@ -300,6 +302,28 @@ namespace ctranslate2 {
       , _activation_type(activation_type)
       , _is_layer_out(is_layer_out)
     {
+      // One-shot probe: at Dense construction we have the pristine `_bias`
+      // pointer straight from the model's variable index. If values here
+      // already differ from `decoder_ff_logit_l2_b`, the corruption is at
+      // load/registration time, not in Dense::operator().
+      if (std::getenv("CT2_S2S_PROBE_DENSE_BIAS") && _bias
+          && _bias->dtype() == DataType::FLOAT32
+          && _bias->device() == Device::CPU) {
+        const float* p = _bias->data<float>();
+        const dim_t n = _bias->size();
+        float mn = p[0], mx = p[0], sum = 0.f;
+        for (dim_t i = 0; i < n; ++i) {
+          mn = std::min(mn, p[i]);
+          mx = std::max(mx, p[i]);
+          sum += p[i];
+        }
+        std::fprintf(stderr,
+                     "[s2s_probe] Dense(%s)/bias n=%lld min=%.4f max=%.4f mean=%.4f "
+                     "ptr=%p data=%p first4=[%.4f %.4f %.4f %.4f]\n",
+                     scope.c_str(), (long long)n, mn, mx, sum / n,
+                     (const void*)_bias, (const void*)p,
+                     p[0], p[1], p[2], p[3]);
+      }
     }
 
     DataType Dense::output_type() const {
