@@ -334,6 +334,22 @@ def _s2s_validate_tensor_set(model):
             "Marian s2s converter: unused tensor(s) in NPZ (unknown to this "
             "converter): %s" % sorted(extra)
         )
+    # Reject corrupted model files up front: NaN/Inf in any expected weight
+    # propagates silently through conversion and only surfaces as garbage
+    # output at inference time.
+    bad = []
+    for name in sorted(expected):
+        arr = model[name]
+        if arr.dtype.kind != "f":
+            continue
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            bad.append(name)
+    if bad:
+        raise ValueError(
+            "Marian s2s converter: tensor(s) contain NaN or Inf values; "
+            "the model file is corrupted or came from a diverged training "
+            "run: %s" % bad
+        )
 
 
 def _build_s2s_spec(config, model, vocabs):

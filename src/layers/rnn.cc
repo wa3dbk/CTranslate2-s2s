@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -63,6 +64,29 @@ namespace ctranslate2 {
                      n > 2 ? d[2] : 0.0f,
                      n > 3 ? d[3] : 0.0f,
                      n > 4 ? d[4] : 0.0f);
+      }
+
+      // One-shot dump of a 2-D [B, V] tensor's first row to a raw float32 file.
+      // Gated by `CT2_S2S_DUMP_LOGITS=<path>`; fires at most once per process.
+      static void dump_logits_once(const StorageView& t) {
+        static const char* path = std::getenv("CT2_S2S_DUMP_LOGITS");
+        if (!path || !*path) return;
+        static bool fired = false;
+        if (fired) return;
+        if (t.rank() != 2) return;
+        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
+        if (host.dtype() != DataType::FLOAT32) return;
+        const dim_t V = host.dim(1);
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
+          return;
+        }
+        out.write(reinterpret_cast<const char*>(host.data<float>()),
+                  static_cast<std::streamsize>(V * sizeof(float)));
+        std::fprintf(stderr, "[s2s_dump] wrote %lld floats to %s\n",
+                     (long long)V, path);
+        fired = true;
       }
 
       // Build a float mask `[B, 1]` where entry b is 1.0 if `t < lengths[b]`,
@@ -717,6 +741,7 @@ namespace ctranslate2 {
       if (logits) {
         _output(h_tilde, *logits);
         probe("dec:logits", *logits);
+        dump_logits_once(*logits);
       }
 
       if (attention) {
