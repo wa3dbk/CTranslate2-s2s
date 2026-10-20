@@ -91,8 +91,11 @@ namespace ctranslate2 {
         }
         out.write(reinterpret_cast<const char*>(host.data<float>()),
                   static_cast<std::streamsize>(host.size() * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld bias floats to %s\n",
-                     (long long)host.size(), path);
+        std::fprintf(stderr, "[s2s_dump] wrote %lld bias floats to %s "
+                     "(bias ptr=%p data=%p)\n",
+                     (long long)host.size(), path,
+                     (const void*)bias,
+                     (const void*)bias->data<float>());
         fired = true;
       }
 
@@ -114,8 +117,11 @@ namespace ctranslate2 {
         }
         out.write(reinterpret_cast<const char*>(host.data<float>()),
                   static_cast<std::streamsize>(V * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld floats to %s\n",
-                     (long long)V, path);
+        std::fprintf(stderr, "[s2s_dump] wrote %lld logits floats to %s "
+                     "(logits ptr=%p data=%p)\n",
+                     (long long)V, path,
+                     (const void*)&t,
+                     (const void*)t.data<float>());
         fired = true;
       }
 
@@ -769,10 +775,13 @@ namespace ctranslate2 {
       probe("deepout:h_tilde", h_tilde);
 
       if (logits) {
+        // Dump bias BEFORE the matmul so we see the pristine _bias storage,
+        // not something that may have been overwritten by a fused op or
+        // aliased write into the output buffer.
+        dump_bias_once(_output.bias());
         _output(h_tilde, *logits);
         probe("dec:logits", *logits);
         dump_logits_once(*logits);
-        dump_bias_once(_output.bias());
       }
 
       if (attention) {
