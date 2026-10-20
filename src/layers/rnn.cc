@@ -402,6 +402,29 @@ namespace ctranslate2 {
       , _fwd(model, scope + "/forward_cell",  /*has_input=*/true, /*final=*/false)
       , _bwd(model, scope + "/backward_cell", /*has_input=*/true, /*final=*/false)
       , _dim_rnn(_fwd.output_size()) {
+      if (s2s_debug_enabled()) {
+        const StorageView& w = model.get_variable(scope + "/embeddings/weight");
+        std::fprintf(stderr,
+                     "[s2s_probe] model_var %s/embeddings/weight dtype=%d "
+                     "shape0=%lld shape1=%lld\n",
+                     scope.c_str(), static_cast<int>(w.dtype()),
+                     (long long)(w.rank() > 0 ? w.dim(0) : 0),
+                     (long long)(w.rank() > 1 ? w.dim(1) : 0));
+        const StorageView* s = model.get_variable_if_exists(scope + "/embeddings/weight_scale");
+        if (s) {
+          std::fprintf(stderr,
+                       "[s2s_probe] model_var %s/embeddings/weight_scale "
+                       "dtype=%d size=%lld\n",
+                       scope.c_str(), static_cast<int>(s->dtype()),
+                       (long long)s->size());
+          probe("enc:embedding_scale", *s);
+        } else {
+          std::fprintf(stderr,
+                       "[s2s_probe] model_var %s/embeddings/weight_scale: "
+                       "<not present>\n", scope.c_str());
+        }
+        probe("enc:embedding_table", w);
+      }
     }
 
     DataType BiGRUEncoder::output_type() const {
