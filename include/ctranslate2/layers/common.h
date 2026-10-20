@@ -133,6 +133,7 @@ namespace ctranslate2 {
       dim_t output_size() const override;
       void operator()(const StorageView& input, StorageView& output, const StorageView* residual = nullptr) const;
       void select_weights(const StorageView* index, const StorageView* extra_bias = nullptr);
+      const StorageView* bias() const { return _bias; }
     private:
       bool _packed_weight;
       const StorageView& _weight;

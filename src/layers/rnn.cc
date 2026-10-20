@@ -66,6 +66,36 @@ namespace ctranslate2 {
                      n > 4 ? d[4] : 0.0f);
       }
 
+      // One-shot dump of a 1-D [V] tensor (output bias) to a raw float32 file.
+      // Gated by `CT2_S2S_DUMP_BIAS=<path>`; fires at most once per process.
+      static void dump_bias_once(const StorageView* bias) {
+        static const char* path = std::getenv("CT2_S2S_DUMP_BIAS");
+        if (!path || !*path) return;
+        static bool fired = false;
+        if (fired) return;
+        if (!bias || bias->empty()) {
+          std::fprintf(stderr, "[s2s_dump] output bias is null/empty\n");
+          fired = true;
+          return;
+        }
+        StorageView host = bias->device() == Device::CPU ? *bias : bias->to(Device::CPU);
+        if (host.dtype() != DataType::FLOAT32) {
+          std::fprintf(stderr, "[s2s_dump] bias dtype=%d (skipped)\n",
+                       static_cast<int>(host.dtype()));
+          return;
+        }
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
+          return;
+        }
+        out.write(reinterpret_cast<const char*>(host.data<float>()),
+                  static_cast<std::streamsize>(host.size() * sizeof(float)));
+        std::fprintf(stderr, "[s2s_dump] wrote %lld bias floats to %s\n",
+                     (long long)host.size(), path);
+        fired = true;
+      }
+
       // One-shot dump of a 2-D [B, V] tensor's first row to a raw float32 file.
       // Gated by `CT2_S2S_DUMP_LOGITS=<path>`; fires at most once per process.
       static void dump_logits_once(const StorageView& t) {
@@ -742,6 +772,7 @@ namespace ctranslate2 {
         _output(h_tilde, *logits);
         probe("dec:logits", *logits);
         dump_logits_once(*logits);
+        dump_bias_once(_output.bias());
       }
 
       if (attention) {
