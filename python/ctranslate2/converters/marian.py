@@ -388,6 +388,10 @@ def _build_s2s_spec(config, model, vocabs):
     spec.register_source_vocabulary(vocabs[0])
     spec.register_target_vocabulary(vocabs[-1])
     spec.config.add_source_eos = True
+    # Marian s2s decoders are trained to start generation from EOS — the same
+    # id used to terminate sequences. The CT2 default `<s>` is not in Marian
+    # vocabularies and would be resolved to <unk>, poisoning the first step.
+    spec.config.decoder_start_token = "</s>"
     # Marian's LayerNormalization uses eps=1e-9. The betas injected above make
     # CT2 pick its full LayerNorm path (gamma * (x - mean)/sqrt(var + eps))
     # instead of the RMSNorm fallback it uses when beta is absent.
