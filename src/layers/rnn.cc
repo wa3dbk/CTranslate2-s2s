@@ -208,48 +208,76 @@ namespace ctranslate2 {
                                     StorageView& alignment) const {
       const Device device = query.device();
       const DataType dtype = _query_dense.output_type();
-      const dim_t B = projected_memory.dim(0);
+      const dim_t Bq = query.dim(0);
+      const dim_t B_mem = projected_memory.dim(0);
       const dim_t S = projected_memory.dim(1);
       const dim_t A = projected_memory.dim(2);
       const dim_t E_mem = memory.dim(2);
 
-      // Query side: q = ln_state(Wa * query) -> [B, A].
+      // During beam search `query` is beam-expanded (B_batch * beam) while
+      // `projected_memory`/`memory`/`memory_lengths` stay at B_batch (we keep
+      // them off the auto-replication path in `replicate_state`). Tile the
+      // memory-side tensors up to the query batch size for this call; the
+      // decoder's state is left untouched.
+      if (Bq % B_mem != 0)
+        throw std::invalid_argument(
+            "BahdanauAttention: query batch is not a multiple of memory batch");
+      const dim_t beam = Bq / B_mem;
+
+      // Fast path for beam == 1 (greedy): avoid an unnecessary deep copy by
+      // forwarding the state tensors directly.
+      StorageView pm_tiled(dtype, device);
+      StorageView mem_tiled(memory.dtype(), device);
+      StorageView lengths_tiled(memory_lengths.dtype(), device);
+      const StorageView* pm_ptr      = &projected_memory;
+      const StorageView* mem_ptr     = &memory;
+      const StorageView* lengths_ptr = &memory_lengths;
+      if (beam > 1) {
+        pm_tiled      = projected_memory;  repeat_batch(pm_tiled,      beam);
+        mem_tiled     = memory;            repeat_batch(mem_tiled,     beam);
+        lengths_tiled = memory_lengths;    repeat_batch(lengths_tiled, beam);
+        pm_ptr      = &pm_tiled;
+        mem_ptr     = &mem_tiled;
+        lengths_ptr = &lengths_tiled;
+      }
+
+      // Query side: q = ln_state(Wa * query) -> [Bq, A].
       StorageView q_proj(dtype, device);
       _query_dense(query, q_proj);
       StorageView q(dtype, device);
       _ln_state(q_proj, q);
 
-      // Broadcast q over the time axis: [B, A] -> [B, 1, A] -> [B, S, A].
+      // Broadcast q over the time axis: [Bq, A] -> [Bq, 1, A] -> [Bq, S, A].
       q.expand_dims(1);
       StorageView q_bcast(dtype, device);
       ops::Tile(1, S)(q, q_bcast);
 
-      // Pre-energy = tanh(q_bcast + projected_memory) -> [B, S, A].
+      // Pre-energy = tanh(q_bcast + projected_memory) -> [Bq, S, A].
       StorageView pre(dtype, device);
-      ops::Add()(q_bcast, projected_memory, pre);
+      ops::Add()(q_bcast, *pm_ptr, pre);
       StorageView act(dtype, device);
       ops::Tanh()(pre, act);
 
-      // Energy = act · v -> [B, S]. Reshape to [B*S, A] × [A, 1].
-      act.reshape(Shape{B * S, A});
+      // Energy = act · v -> [Bq, S]. Reshape to [Bq*S, A] × [A, 1].
+      act.reshape(Shape{Bq * S, A});
       StorageView v_col(dtype, device);
       v_col.view(const_cast<float*>(_v.data<float>()), Shape{A, 1});
       StorageView energy_flat(dtype, device);
       ops::MatMul()(act, v_col, energy_flat);
-      energy_flat.reshape(Shape{B, S});
+      energy_flat.reshape(Shape{Bq, S});
       StorageView energy = std::move(energy_flat);
 
       // Masked softmax along time axis.
-      ops::SoftMax()(energy, &memory_lengths, alignment);  // [B, S]
+      ops::SoftMax()(energy, lengths_ptr, alignment);  // [Bq, S]
 
-      // Context: alignment [B, S] * memory [B, S, E_mem] -> [B, E_mem].
-      // Compute as [B, 1, S] × [B, S, E_mem] -> [B, 1, E_mem] -> squeeze.
+      // Context: alignment [Bq, S] * memory [Bq, S, E_mem] -> [Bq, E_mem].
+      // Compute as [Bq, 1, S] × [Bq, S, E_mem] -> [Bq, 1, E_mem] -> squeeze.
       StorageView align_row;
       align_row.shallow_copy(alignment);
-      align_row.reshape(Shape{B, 1, S});
+      align_row.reshape(Shape{Bq, 1, S});
       StorageView ctx3(dtype, device);
-      ops::MatMul()(align_row, memory, ctx3);  // [B, 1, E_mem]
-      ctx3.reshape(Shape{B, E_mem});
+      ops::MatMul()(align_row, *mem_ptr, ctx3);  // [Bq, 1, E_mem]
+      ctx3.reshape(Shape{Bq, E_mem});
       context = std::move(ctx3);
     }
 
