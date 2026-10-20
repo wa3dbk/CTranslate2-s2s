@@ -512,11 +512,16 @@ namespace ctranslate2 {
         if (device != Device::CPU)
           pooled = pooled.to(device);
 
+        // Marian's `ff_state` is `tanh(LN(dot(x, W), gamma, b))`. Without
+        // the tanh, the initial hidden state is unbounded and the decoder's
+        // GRU gates get driven to saturation on step 0.
         StorageView h0(output_type(), device);
         _init_state_linear(pooled, h0);
         StorageView h0_norm(output_type(), device);
         _init_state_ln(h0, h0_norm);
-        hidden = std::move(h0_norm);
+        StorageView h0_act(output_type(), device);
+        ops::Tanh()(h0_norm, h0_act);
+        hidden = std::move(h0_act);
 
         // Replicate to match the current (possibly beam-expanded) batch size.
         const dim_t source_batch = hidden.dim(0);
