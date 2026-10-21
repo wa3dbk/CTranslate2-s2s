@@ -99,6 +99,29 @@ namespace ctranslate2 {
         fired = true;
       }
 
+      // One-shot dump of a 2-D [B, D] tensor's first row to a raw float32 file.
+      // Gated by `CT2_S2S_DUMP_HTILDE=<path>`; fires at most once per process.
+      static void dump_htilde_once(const StorageView& t) {
+        static const char* path = std::getenv("CT2_S2S_DUMP_HTILDE");
+        if (!path || !*path) return;
+        static bool fired = false;
+        if (fired) return;
+        if (t.rank() != 2) return;
+        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
+        if (host.dtype() != DataType::FLOAT32) return;
+        const dim_t D = host.dim(1);
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
+          return;
+        }
+        out.write(reinterpret_cast<const char*>(host.data<float>()),
+                  static_cast<std::streamsize>(D * sizeof(float)));
+        std::fprintf(stderr, "[s2s_dump] wrote %lld h_tilde floats to %s\n",
+                     (long long)D, path);
+        fired = true;
+      }
+
       // One-shot dump of a 2-D [B, V] tensor's first row to a raw float32 file.
       // Gated by `CT2_S2S_DUMP_LOGITS=<path>`; fires at most once per process.
       static void dump_logits_once(const StorageView& t) {
@@ -773,6 +796,7 @@ namespace ctranslate2 {
       StorageView h_tilde(dtype, device);
       ops::Tanh()(sum012, h_tilde);
       probe("deepout:h_tilde", h_tilde);
+      dump_htilde_once(h_tilde);
 
       if (logits) {
         // Dump bias BEFORE the matmul so we see the pristine _bias storage,
