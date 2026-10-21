@@ -99,6 +99,39 @@ namespace ctranslate2 {
         fired = true;
       }
 
+      // One-shot dump of a 2-D [B, D] tensor's first row to a raw float32 file,
+      // gated by the given env var. Fires at most once per (env_var,label) pair.
+      static void dump_row0_once(const char* env_var,
+                                 const char* label,
+                                 const StorageView& t,
+                                 bool& fired) {
+        if (fired) return;
+        const char* path = std::getenv(env_var);
+        if (!path || !*path) return;
+        if (t.rank() != 2) {
+          std::fprintf(stderr, "[s2s_dump] %s: unexpected rank=%d, skipping\n",
+                       label, (int)t.rank());
+          return;
+        }
+        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
+        if (host.dtype() != DataType::FLOAT32) {
+          std::fprintf(stderr, "[s2s_dump] %s: unexpected dtype=%d\n",
+                       label, (int)host.dtype());
+          return;
+        }
+        const dim_t D = host.dim(1);
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+          std::fprintf(stderr, "[s2s_dump] %s: failed to open %s\n", label, path);
+          return;
+        }
+        out.write(reinterpret_cast<const char*>(host.data<float>()),
+                  static_cast<std::streamsize>(D * sizeof(float)));
+        std::fprintf(stderr, "[s2s_dump] wrote %lld %s floats to %s\n",
+                     (long long)D, label, path);
+        fired = true;
+      }
+
       // One-shot dump of a 2-D [B, D] tensor's first row to a raw float32 file.
       // Gated by `CT2_S2S_DUMP_HTILDE=<path>`; fires at most once per process.
       static void dump_htilde_once(const StorageView& t) {
@@ -776,6 +809,16 @@ namespace ctranslate2 {
       probe("dec:new_hidden", new_hidden);
       probe("dec:context", context);
       probe("dec:alignment", alignment);
+
+      // Env-var-gated one-shot dumps of the three deep-output inputs. These
+      // mirror MARIAN_DUMP_EMB / _STATE / _CTX on the Marian side so we can
+      // localize divergence per input before it feeds the deep-output MLP.
+      {
+        static bool d_emb = false, d_state = false, d_ctx = false;
+        dump_row0_once("CT2_S2S_DUMP_EMB",   "emb",     embed,      d_emb);
+        dump_row0_once("CT2_S2S_DUMP_STATE", "state",   new_hidden, d_state);
+        dump_row0_once("CT2_S2S_DUMP_CTX",   "context", context,    d_ctx);
+      }
 
       // Deep-output: Marian builds `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))`
       // where `i` iterates over (embeddings, decoder hidden, aligned context).
