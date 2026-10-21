@@ -14,14 +14,20 @@ class GRUCellSpec(model_spec.LayerSpec):
     """A single Marian GRU cell with scale-only layer normalization.
 
     Weight layout after conversion from Marian's `[W | Wx]`, `[U | Ux]`,
-    `[b | bx]` tensors:
-      - `input.weight`  : [I, 3H] = concat(W, Wx)  on gate axis [reset|update|candidate]
-      - `input.bias`    : [3H]    = concat(b, bx)
-      - `recurrent.weight`: [H, 3H] = concat(U, Ux)
-      - `recurrent.bias`: [3H] zeros (Marian stores bias only on the input side)
-      - `ln_input.gamma`:  Marian `_gamma1` reshaped to 1-D
+    `[b | bx]` tensors (gate axis order `[reset | update | candidate]`):
+      - `input.weight`     : [I, 3H] = concat(W, Wx)
+      - `input.bias`       : [3H] zeros (Marian bias is the LN shift)
+      - `recurrent.weight` : [H, 3H] = concat(U, Ux)
+      - `recurrent.bias`   : [3H] zeros
+      - `ln_input.gamma`   : Marian `_gamma1` reshaped to 1-D
       - `ln_recurrent.gamma`: Marian `_gamma2` reshaped to 1-D
-      - `ln_*.beta`: zeros (Marian layer norm is scale-only)
+
+    The bias partition between `ln_input.beta` and `ln_recurrent.beta`
+    reproduces Marian's non-final vs final `gruOps` kernel branch *without*
+    changing the CT2 kernel. See `_s2s_load_cell` in the converter for the
+    derivation. In short: non-final cells carry `[b | bx]` on `ln_input.beta`
+    (bias not gated by reset); final cells route `bx` to `ln_recurrent.beta`
+    so `r*cs = r*(sU_ln + bx)` reproduces Marian's `(s@U + bx)*r` term.
     """
 
     def __init__(self, has_input=True, layer_norm=True):

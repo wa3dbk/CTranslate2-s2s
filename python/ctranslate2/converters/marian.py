@@ -197,8 +197,26 @@ def _s2s_bias_concat(np_b, np_bx):
     return np.concatenate([np_b.reshape(-1), np_bx.reshape(-1)], axis=0)
 
 
-def _s2s_load_cell(spec_cell, model, prefix, dim_rnn):
-    """Populate a `GRUCellSpec` from Marian tensors under `<prefix>_...`."""
+def _s2s_load_cell(spec_cell, model, prefix, dim_rnn, final=False):
+    """Populate a `GRUCellSpec` from Marian tensors under `<prefix>_...`.
+
+    `final` selects between Marian's two cGRU kernel branches. Both branches
+    share the parameter layout; they differ only in whether the candidate bias
+    `bx` is reset-gated:
+
+      non-final:  h = tanh(x@W_c + s@U_c * r + bx)
+      final:      h = tanh(x@W_c + (s@U_c + bx) * r)
+
+    Marian's vanilla `GRU` cell (which this converter targets) adds the whole
+    bias *after* the LN inside the fused `gruOps` kernel, so we can reproduce
+    the final formula without any kernel change by routing `bx` from the input
+    side to the recurrent side: the candidate pre-activation then becomes
+    `cx + r * cs = x@W_c_ln + r * (s@U_c_ln + bx)` — bit-exact Marian final.
+    The r/z pre-activations are a plain sum of the two LN'd projections, so
+    their bias routing is commutative.
+
+    Marian wires the decoder's cGRU as GRU1 (non-final) → GRU2 (final).
+    """
     H = dim_rnn
     U = model["%s_U" % prefix]
     Ux = model["%s_Ux" % prefix]
@@ -213,21 +231,28 @@ def _s2s_load_cell(spec_cell, model, prefix, dim_rnn):
             % (prefix, Ux.shape[-1], H)
         )
     spec_cell.recurrent.weight = _s2s_gate_concat(U, Ux).astype(np.float32)
-    # Recurrent side has no bias — bias is fused on the input side.
     spec_cell.ln_recurrent.gamma = model["%s_gamma2" % prefix].reshape(-1).astype(np.float32)
-    spec_cell.ln_recurrent.beta = np.zeros(3 * H, dtype=np.float32)
 
     W = model["%s_W" % prefix]
     Wx = model["%s_Wx" % prefix]
-    b = model["%s_b" % prefix]
-    bx = model["%s_bx" % prefix]
+    b = model["%s_b" % prefix].reshape(-1).astype(np.float32)
+    bx = model["%s_bx" % prefix].reshape(-1).astype(np.float32)
     spec_cell.input.weight = _s2s_gate_concat(W, Wx).astype(np.float32)
     # Marian's layer-normalized Dense is `layerNorm(dot(x, W), gamma, b)` — the
     # bias is the LN *shift*, not an affine Dense bias. Store it on ln_input.beta
     # and leave input.bias as zeros so CT2 computes the exact Marian math.
     spec_cell.input.bias = np.zeros(3 * H, dtype=np.float32)
     spec_cell.ln_input.gamma = model["%s_gamma1" % prefix].reshape(-1).astype(np.float32)
-    spec_cell.ln_input.beta = _s2s_bias_concat(b, bx).astype(np.float32)
+    if final:
+        # bias on input side carries only (b_r, b_z); candidate bias moves to
+        # the recurrent side so the r*cs multiply gates it (final formula).
+        spec_cell.ln_input.beta = np.concatenate(
+            [b, np.zeros(H, dtype=np.float32)]).astype(np.float32)
+        spec_cell.ln_recurrent.beta = np.concatenate(
+            [np.zeros(2 * H, dtype=np.float32), bx]).astype(np.float32)
+    else:
+        spec_cell.ln_input.beta = np.concatenate([b, bx]).astype(np.float32)
+        spec_cell.ln_recurrent.beta = np.zeros(3 * H, dtype=np.float32)
 
 
 def _s2s_load_attention(spec_attn, model, prefix, dim_enc):
@@ -385,8 +410,10 @@ def _build_s2s_spec(config, model, vocabs):
     _s2s_load_cell(spec.encoder.forward_cell,  model, "encoder_bi",   dim_rnn=H)
     _s2s_load_cell(spec.encoder.backward_cell, model, "encoder_bi_r", dim_rnn=H)
 
-    _s2s_load_cell(spec.decoder.cell.gru1, model, "decoder_cell1", dim_rnn=H)
-    _s2s_load_cell(spec.decoder.cell.gru2, model, "decoder_cell2", dim_rnn=H)
+    _s2s_load_cell(spec.decoder.cell.gru1, model, "decoder_cell1", dim_rnn=H,
+                   final=False)
+    _s2s_load_cell(spec.decoder.cell.gru2, model, "decoder_cell2", dim_rnn=H,
+                   final=True)
 
     _s2s_load_attention(spec.decoder.cell.attention, model, "decoder", dim_enc=2 * H)
 
