@@ -813,7 +813,26 @@ namespace ctranslate2 {
       StorageView h_tilde(dtype, device);
       ops::Tanh()(sum012, h_tilde);
       probe("deepout:h_tilde", h_tilde);
+      {
+        static bool once = false;
+        if (!once) {
+          std::fprintf(stderr,
+                       "[s2s_dump] BREADCRUMB-A: about to call dump_htilde_once "
+                       "(h_tilde rank=%d dtype=%d)\n",
+                       (int)h_tilde.rank(), (int)h_tilde.dtype());
+          std::fflush(stderr);
+          once = true;
+        }
+      }
       dump_htilde_once(h_tilde);
+      {
+        static bool once = false;
+        if (!once) {
+          std::fprintf(stderr, "[s2s_dump] BREADCRUMB-B: returned from dump_htilde_once\n");
+          std::fflush(stderr);
+          once = true;
+        }
+      }
 
       if (logits) {
         // Dump bias BEFORE the matmul so we see the pristine _bias storage,
