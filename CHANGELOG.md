@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### New features
+
+* Support converting and running MarianNMT `type: s2s` models (RNN encoder-decoder: bi-directional GRU encoder, Bahdanau attention, conditional-GRU decoder with layer normalization). Upstream CTranslate2 only supports Marian's `transformer` type. See [`README_s2s.md`](README_s2s.md) for the design spec and the Marian section of [`README.md`](README.md) for the user-facing conversion, inference, and benchmarking recipe.
+
+### Fixes and improvements
+
+* Route the GRU2 candidate bias slice to the recurrent layer-norm's beta so CT2's branch-free GRU kernel reproduces Marian's `final=true` kernel (`h = tanh(xW + r*(sU + bx))`) without a kernel fork. End-to-end BLEU parity against `marian-decoder` is within tie-break residual (0.1–0.5 BLEU).
+
 ## [v4.8.3](https://github.com/OpenNMT/CTranslate2/releases/tag/v4.8.3) (2026-10-13)
 
 ### New features

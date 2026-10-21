@@ -188,6 +188,52 @@ for line in sys.stdin:
 diff hyps.marian.txt hyps.ct2.txt
 ```
 
+### Benchmarking against `marian-decoder`
+
+A fair CPU benchmark requires pinning both runtimes to the same core budget and matching numeric settings. Thread-matrix parity rule: `(parallel-batches) × (BLAS-threads-per-batch) ≤ physical cores`.
+
+The two runtimes expose this differently:
+
+| Setting | Marian | CTranslate2 |
+|---|---|---|
+| Parallel batches | `--cpu-threads N` (one worker thread per N; MKL stays single-threaded inside each) | `--inter_threads N` |
+| BLAS threads per batch | *(not exposed; always 1 when `--cpu-threads > 0`)* | `--intra_threads N` |
+| Compute precision | fp32 (default) | `--compute_type float32` |
+
+On a 4-physical-core box, the apples-to-apples pair is:
+
+- `marian-decoder --cpu-threads 4`
+- `ct2-translator --inter_threads 4 --intra_threads 1 --compute_type float32`
+
+CT2 can also run **one** batch at a time with BLAS across all cores (`--inter_threads 1 --intra_threads 4`). That configuration is not expressible in Marian and typically wins on small batches — report it as a second CT2 row, not as the apples-to-apples number.
+
+Beam search, length penalty, and vocabulary handling must match or BLEU differences become uninterpretable:
+
+| Knob | Marian | CTranslate2 |
+|---|---|---|
+| Beam size | `--beam-size 12` | `--beam_size 12` |
+| Length normalisation | `--normalize 1.0` (= divide score by `len^1`) | `--length_penalty 1.0` (same convention) |
+| Disallow `<unk>` | `--allow-unk false` (default) | `--disable_unk` |
+| Mini-batch | `--mini-batch M --maxi-batch M --maxi-batch-sort src` | `--max_batch_size M` + `--batch_type examples` |
+
+CT2's `--inter_threads` and `--intra_threads` default to the number of physical cores, which will double-count against Marian's `--cpu-threads`. Always set both explicitly in a benchmark.
+
+**Environment hygiene.** Both runtimes link against MKL / OpenMP and will silently obey process-wide thread caps. Before every run:
+
+```bash
+unset MKL_NUM_THREADS OMP_NUM_THREADS OPENBLAS_NUM_THREADS
+```
+
+Otherwise `source /opt/intel/oneapi/mkl/latest/env/vars.sh` (needed to compile Marian with `-DUSE_STATIC_LIBS=on -DCOMPILE_CPU=on`) can leave `MKL_NUM_THREADS` set in the shell and fight the per-tool flags. The static MKL link affects compile-time only; at run-time MKL still obeys environment and per-call thread settings.
+
+**Metrics worth reporting.** BLEU on a held-out test set with `sacrebleu` and identical detokenisation on both sides; wall-clock throughput (output tokens/s) at a few batch sizes (1, 32, 64) measured after a warm-up run; peak RSS (`/usr/bin/time -l` on macOS, `/usr/bin/time -v` on Linux). A clean report is a 3-row table — Marian baseline, CT2 apples-to-apples, CT2 best — plus an optional 4th `--compute_type int8` row labelled separately (Marian has no equivalent switch).
+
+**Honest caveats.** CT2's beam search is not bit-identical to Marian's at tie-breaks, so a 0.1–0.5 BLEU residual between the two runtimes on the same model is expected and not a bug. Int8 scale calibration is embedding-table-wide; models with extreme embedding ranges may show slightly larger BLEU drops under `--compute_type int8` than Transformer models.
+
+### Design spec
+
+The architecture, weight mapping, converter guards, state-handling choices, and testing tiers for the s2s path live in [`README_s2s.md`](README_s2s.md). Read that if you're adding LSTM / `gru-nematus` support, relaxing a converter guard, extending alignment extraction, or wiring up CUDA fp16 for s2s.
+
 Everything below this notice is upstream CTranslate2 documentation and applies unchanged (transformer paths are untouched).
 
 ---
