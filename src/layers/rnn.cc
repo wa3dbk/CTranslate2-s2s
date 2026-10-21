@@ -102,13 +102,30 @@ namespace ctranslate2 {
       // One-shot dump of a 2-D [B, D] tensor's first row to a raw float32 file.
       // Gated by `CT2_S2S_DUMP_HTILDE=<path>`; fires at most once per process.
       static void dump_htilde_once(const StorageView& t) {
-        static const char* path = std::getenv("CT2_S2S_DUMP_HTILDE");
+        static bool traced = false;
+        if (!traced) {
+          const char* raw = std::getenv("CT2_S2S_DUMP_HTILDE");
+          std::fprintf(stderr,
+                       "[s2s_dump] htilde entry: env=%s rank=%d dtype=%d dev=%d\n",
+                       raw ? raw : "<unset>", (int)t.rank(),
+                       (int)t.dtype(), (int)t.device());
+          traced = true;
+        }
+        const char* path = std::getenv("CT2_S2S_DUMP_HTILDE");
         if (!path || !*path) return;
         static bool fired = false;
         if (fired) return;
-        if (t.rank() != 2) return;
+        if (t.rank() != 2) {
+          std::fprintf(stderr, "[s2s_dump] htilde: unexpected rank=%d, skipping\n",
+                       (int)t.rank());
+          return;
+        }
         StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) return;
+        if (host.dtype() != DataType::FLOAT32) {
+          std::fprintf(stderr, "[s2s_dump] htilde: unexpected dtype=%d\n",
+                       (int)host.dtype());
+          return;
+        }
         const dim_t D = host.dim(1);
         std::ofstream out(path, std::ios::binary);
         if (!out) {
