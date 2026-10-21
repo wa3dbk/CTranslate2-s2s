@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -38,15 +39,34 @@ def read_floats(path):
 
 
 def load_vocab(path):
-    """Load an id -> token mapping from target_vocabulary.json."""
+    """Load an id -> token mapping from target_vocabulary.json or Marian YAML."""
     if not path:
         return None
-    raw = json.loads(Path(path).read_text())
-    if isinstance(raw, list):
-        return {i: tok for i, tok in enumerate(raw)}
-    if isinstance(raw, dict):
-        return {int(v): k for k, v in raw.items()}
-    raise ValueError(f"unsupported vocab format in {path}")
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    stripped = text.lstrip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        raw = json.loads(text)
+        if isinstance(raw, list):
+            return {i: tok for i, tok in enumerate(raw)}
+        if isinstance(raw, dict):
+            return {int(v): k for k, v in raw.items()}
+        raise ValueError(f"unsupported JSON vocab format in {path}")
+    # Marian YAML: flat `token: id` per line (quoted keys allowed).
+    out = {}
+    pat = re.compile(r'^"?(.*?)"?\s*:\s*(\d+)\s*$')
+    for line in text.splitlines():
+        m = pat.match(line.rstrip())
+        if m:
+            out[int(m.group(2))] = m.group(1)
+    if not out:
+        raise ValueError(f"no entries parsed from vocab {path}")
+    return out
+
+
+def rank_of(xs, tid):
+    """Rank of tid in xs when sorted descending (0 = argmax)."""
+    v = xs[tid]
+    return sum(1 for x in xs if x > v)
 
 
 def logsumexp(xs):
@@ -73,8 +93,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ct2", required=True)
     ap.add_argument("--marian", required=True)
-    ap.add_argument("--vocab", help="Path to target_vocabulary.json (optional)")
+    ap.add_argument("--vocab", help="target_vocabulary.json or Marian YAML (optional)")
     ap.add_argument("-k", "--topk", type=int, default=20)
+    ap.add_argument("--unk-id", type=int, default=1)
+    ap.add_argument("--eos-id", type=int, default=0)
+    ap.add_argument("--marian-npz", help="original Marian NPZ (reads decoder_ff_logit_l2_b)")
+    ap.add_argument("--ct2-bias-bin", help="CT2 bias dump from CT2_S2S_DUMP_BIAS")
     args = ap.parse_args()
 
     ct2 = read_floats(args.ct2)
@@ -110,6 +134,38 @@ def main():
     print(f"\nTop-{args.topk} by Marian:")
     for tid in topk(mar_logp, args.topk):
         print(fmt_row(tid, ct2_logp[tid], mar_logp[tid]))
+
+    # Sentinel-id reporting: UNK/EOS ranks + raw logits on each side. A
+    # chronically over-ranked UNK on the CT2 side was what motivated this
+    # tool, so always print these even without --vocab.
+    print(f"\nSentinels (rank is 0-indexed over V tokens):")
+    for name, tid in (("unk", args.unk_id), ("eos", args.eos_id)):
+        tok = f"'{vocab[tid]}'" if vocab and tid in vocab else ""
+        print(f"  {name} id={tid} {tok:<16}  "
+              f"CT2 rank={rank_of(ct2, tid):>5}  logit={ct2[tid]:+.4f}  "
+              f"Marian rank={rank_of(mar, tid):>5}  logit={mar[tid]:+.4f}")
+
+    # Output-bias byte-compare: static-param check that doesn't need re-decode.
+    if args.marian_npz and args.ct2_bias_bin:
+        try:
+            import numpy as np
+        except ImportError:
+            print("\n[bias check skipped: numpy not available]")
+            return
+        print(f"\nOutput bias (decoder_ff_logit_l2_b) byte-compare:")
+        npz = np.load(args.marian_npz)
+        mb = npz["decoder_ff_logit_l2_b"].reshape(-1).astype(np.float32)
+        cb = np.frombuffer(Path(args.ct2_bias_bin).read_bytes(), dtype=np.float32)
+        print(f"  marian: n={mb.size} min={mb.min():+.4f} max={mb.max():+.4f}")
+        print(f"  ct2   : n={cb.size} min={cb.min():+.4f} max={cb.max():+.4f}")
+        if mb.size != cb.size:
+            print(f"  SIZE MISMATCH")
+        else:
+            d = mb - cb
+            print(f"  max|.|={float(abs(d).max()):.6e}  "
+                  f"bytes-equal={bool((mb == cb).all())}")
+            print(f"  b[unk={args.unk_id}]: marian={mb[args.unk_id]:+.4f} ct2={cb[args.unk_id]:+.4f}")
+            print(f"  b[eos={args.eos_id}]: marian={mb[args.eos_id]:+.4f} ct2={cb[args.eos_id]:+.4f}")
 
 
 if __name__ == "__main__":

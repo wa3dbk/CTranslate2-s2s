@@ -15,6 +15,14 @@ def load(p):
     return np.frombuffer(Path(p).read_bytes(), dtype=np.float32)
 
 
+def _vec_stats(a, b, label):
+    diff = a - b
+    denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)
+    cos = float(np.dot(a, b) / denom)
+    print(f"    [{label}] n={a.size}  max|.|={np.abs(diff).max():.6f}  "
+          f"mean|.|={np.abs(diff).mean():.6f}  cosine={cos:.4f}")
+
+
 def report(label, m, c):
     print(f"\n=== {label} ===")
     print(f"  marian: n={m.size}  min={m.min():+.4f} max={m.max():+.4f} "
@@ -28,10 +36,22 @@ def report(label, m, c):
     cos = float(np.dot(m, c) / (np.linalg.norm(m) * np.linalg.norm(c) + 1e-12))
     print(f"  max|.|={np.abs(diff).max():.6f}  mean|.|={np.abs(diff).mean():.6f}  "
           f"cosine={cos:.4f}  pearson={np.corrcoef(m, c)[0,1]:.4f}")
+
+    # If size is even, break into two halves and report per-half.
+    # For bi-GRU memory (2*dim_rnn=4048) this isolates fwd vs bwd lanes.
+    # For attention context (also 2*dim_rnn, read from memory) same split applies.
+    if m.size % 2 == 0:
+        half = m.size // 2
+        _vec_stats(m[:half], c[:half], "lo-half")
+        _vec_stats(m[half:], c[half:], "hi-half")
+
     order = np.argsort(-np.abs(diff))[:5]
     for i in order:
+        half_tag = ""
+        if m.size % 2 == 0:
+            half_tag = "  (lo)" if i < m.size // 2 else "  (hi)"
         print(f"    dim={int(i):>4}  marian={m[i]:+.4f}  ct2={c[i]:+.4f}  "
-              f"diff={diff[i]:+.4f}")
+              f"diff={diff[i]:+.4f}{half_tag}")
 
 
 def main():
@@ -42,7 +62,7 @@ def main():
     args = ap.parse_args()
     d = Path(args.dir)
 
-    for name in ("emb", "state", "ctx", "htilde"):
+    for name in ("memory", "emb", "state", "ctx", "s1", "alignment", "htilde"):
         mp = d / f"marian.{name}.bin"
         cp = d / f"ct2.{name}.bin"
         if not mp.exists() or not cp.exists():
