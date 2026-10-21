@@ -524,6 +524,10 @@ namespace ctranslate2 {
       // s1 = gru1(input_emb, prev_state).
       StorageView s1(dtype, device);
       _gru1(&input_emb, prev_state, s1);
+      {
+        static bool fired = false;
+        dump_row0_once("CT2_S2S_DUMP_S1", "s1", s1, fired);
+      }
 
       // (context, alignment) = attention(query=s1, projected_memory, memory, lengths).
       _attn.compute(s1, projected_memory, memory, memory_lengths, context, alignment);
@@ -826,11 +830,12 @@ namespace ctranslate2 {
       // mirror MARIAN_DUMP_EMB / _STATE / _CTX on the Marian side so we can
       // localize divergence per input before it feeds the deep-output MLP.
       {
-        static bool d_emb = false, d_state = false, d_ctx = false, d_mem = false;
-        dump_row0_once("CT2_S2S_DUMP_EMB",    "emb",     embed,      d_emb);
-        dump_row0_once("CT2_S2S_DUMP_STATE",  "state",   new_hidden, d_state);
-        dump_row0_once("CT2_S2S_DUMP_CTX",    "context", context,    d_ctx);
-        dump_row0_once("CT2_S2S_DUMP_MEMORY", "memory",  memory,     d_mem);
+        static bool d_emb = false, d_state = false, d_ctx = false, d_mem = false, d_align = false;
+        dump_row0_once("CT2_S2S_DUMP_EMB",       "emb",       embed,      d_emb);
+        dump_row0_once("CT2_S2S_DUMP_STATE",     "state",     new_hidden, d_state);
+        dump_row0_once("CT2_S2S_DUMP_CTX",       "context",   context,    d_ctx);
+        dump_row0_once("CT2_S2S_DUMP_MEMORY",    "memory",    memory,     d_mem);
+        dump_row0_once("CT2_S2S_DUMP_ALIGNMENT", "alignment", alignment,  d_align);
       }
 
       // Deep-output: Marian builds `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))`
