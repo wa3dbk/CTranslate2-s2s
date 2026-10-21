@@ -781,6 +781,13 @@ namespace ctranslate2 {
       // Embed ids [B] -> [B, E]. The Embeddings op accepts [B] and returns [B, E].
       StorageView embed(dtype, device);
       _embeddings(ids, embed);
+      // Marian convention: at the first decoder step the target history is
+      // empty, so the embedding fed to the deep-output and the decoder cell
+      // is a zero vector, NOT embed(<BOS>). See
+      // marian/src/models/decoder.h:68 (embeddingsFromPrediction: empty
+      // words -> inits::zeros()) and :50 (training-time shift comment).
+      if (step == 0)
+        embed.zero();
       if (s2s_debug_enabled()) {
         std::fprintf(stderr, "[s2s_probe] === step=%lld ===\n", (long long)step);
       }
