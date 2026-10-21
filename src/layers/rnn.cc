@@ -1,11 +1,6 @@
 #include "rnn.h"
 
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "ctranslate2/decoding_utils.h"
@@ -15,193 +10,6 @@ namespace ctranslate2 {
   namespace layers {
 
     namespace {
-
-      // Env-var-gated NaN/Inf detector. Enable with `CT2_S2S_DEBUG=1`.
-      // Prints shape, finite min/max, NaN/Inf counts, and first-5 values.
-      // CPU-only (moves to CPU if needed).
-      static bool s2s_debug_enabled() {
-        static const bool enabled = std::getenv("CT2_S2S_DEBUG") != nullptr;
-        return enabled;
-      }
-
-      static void probe(const char* tag, const StorageView& t) {
-        if (!s2s_debug_enabled()) return;
-        if (t.empty()) {
-          std::fprintf(stderr, "[s2s_probe] %s: <empty>\n", tag);
-          return;
-        }
-        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) {
-          std::fprintf(stderr, "[s2s_probe] %s: dtype=%d (skipped)\n",
-                       tag, static_cast<int>(host.dtype()));
-          return;
-        }
-        const float* d = host.data<float>();
-        const dim_t n = host.size();
-        dim_t nan_count = 0, inf_count = 0;
-        float fmin = 0.0f, fmax = 0.0f;
-        bool have_finite = false;
-        for (dim_t i = 0; i < n; ++i) {
-          const float v = d[i];
-          if (std::isnan(v)) { ++nan_count; continue; }
-          if (std::isinf(v)) { ++inf_count; continue; }
-          if (!have_finite) { fmin = fmax = v; have_finite = true; }
-          else { if (v < fmin) fmin = v; if (v > fmax) fmax = v; }
-        }
-        std::string shape_s;
-        for (dim_t i = 0; i < host.rank(); ++i) {
-          shape_s += (i ? "x" : "") + std::to_string(host.dim(i));
-        }
-        std::fprintf(stderr,
-                     "[s2s_probe] %s shape=%s n=%lld nan=%lld inf=%lld "
-                     "min=%g max=%g head=[%g %g %g %g %g]\n",
-                     tag, shape_s.c_str(),
-                     (long long)n, (long long)nan_count, (long long)inf_count,
-                     have_finite ? fmin : 0.0f,
-                     have_finite ? fmax : 0.0f,
-                     n > 0 ? d[0] : 0.0f,
-                     n > 1 ? d[1] : 0.0f,
-                     n > 2 ? d[2] : 0.0f,
-                     n > 3 ? d[3] : 0.0f,
-                     n > 4 ? d[4] : 0.0f);
-      }
-
-      // One-shot dump of a 1-D [V] tensor (output bias) to a raw float32 file.
-      // Gated by `CT2_S2S_DUMP_BIAS=<path>`; fires at most once per process.
-      static void dump_bias_once(const StorageView* bias) {
-        static const char* path = std::getenv("CT2_S2S_DUMP_BIAS");
-        if (!path || !*path) return;
-        static bool fired = false;
-        if (fired) return;
-        if (!bias || bias->empty()) {
-          std::fprintf(stderr, "[s2s_dump] output bias is null/empty\n");
-          fired = true;
-          return;
-        }
-        StorageView host = bias->device() == Device::CPU ? *bias : bias->to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) {
-          std::fprintf(stderr, "[s2s_dump] bias dtype=%d (skipped)\n",
-                       static_cast<int>(host.dtype()));
-          return;
-        }
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
-          return;
-        }
-        out.write(reinterpret_cast<const char*>(host.data<float>()),
-                  static_cast<std::streamsize>(host.size() * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld bias floats to %s "
-                     "(bias ptr=%p data=%p)\n",
-                     (long long)host.size(), path,
-                     (const void*)bias,
-                     (const void*)bias->data<float>());
-        fired = true;
-      }
-
-      // One-shot dump of a tensor's leading [..., 0, 0, :] slice (first
-      // dim(-1) floats of the raw row-major buffer) to a raw float32 file,
-      // gated by the given env var. Fires at most once per (env_var,label) pair.
-      // Works for rank-2 [B, D] (writes batch=0 row) and rank-3 [B, S, D]
-      // (writes batch=0, time=0 row).
-      static void dump_row0_once(const char* env_var,
-                                 const char* label,
-                                 const StorageView& t,
-                                 bool& fired) {
-        if (fired) return;
-        const char* path = std::getenv(env_var);
-        if (!path || !*path) return;
-        if (t.rank() < 2) {
-          std::fprintf(stderr, "[s2s_dump] %s: unexpected rank=%d, skipping\n",
-                       label, (int)t.rank());
-          return;
-        }
-        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) {
-          std::fprintf(stderr, "[s2s_dump] %s: unexpected dtype=%d\n",
-                       label, (int)host.dtype());
-          return;
-        }
-        const dim_t D = host.dim(host.rank() - 1);
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-          std::fprintf(stderr, "[s2s_dump] %s: failed to open %s\n", label, path);
-          return;
-        }
-        out.write(reinterpret_cast<const char*>(host.data<float>()),
-                  static_cast<std::streamsize>(D * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld %s floats to %s "
-                             "(rank=%d, last-dim=%lld)\n",
-                     (long long)D, label, path,
-                     (int)host.rank(), (long long)D);
-        fired = true;
-      }
-
-      // One-shot dump of a 2-D [B, D] tensor's first row to a raw float32 file.
-      // Gated by `CT2_S2S_DUMP_HTILDE=<path>`; fires at most once per process.
-      static void dump_htilde_once(const StorageView& t) {
-        static bool traced = false;
-        if (!traced) {
-          const char* raw = std::getenv("CT2_S2S_DUMP_HTILDE");
-          std::fprintf(stderr,
-                       "[s2s_dump] htilde entry: env=%s rank=%d dtype=%d dev=%d\n",
-                       raw ? raw : "<unset>", (int)t.rank(),
-                       (int)t.dtype(), (int)t.device());
-          traced = true;
-        }
-        const char* path = std::getenv("CT2_S2S_DUMP_HTILDE");
-        if (!path || !*path) return;
-        static bool fired = false;
-        if (fired) return;
-        if (t.rank() != 2) {
-          std::fprintf(stderr, "[s2s_dump] htilde: unexpected rank=%d, skipping\n",
-                       (int)t.rank());
-          return;
-        }
-        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) {
-          std::fprintf(stderr, "[s2s_dump] htilde: unexpected dtype=%d\n",
-                       (int)host.dtype());
-          return;
-        }
-        const dim_t D = host.dim(1);
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
-          return;
-        }
-        out.write(reinterpret_cast<const char*>(host.data<float>()),
-                  static_cast<std::streamsize>(D * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld h_tilde floats to %s\n",
-                     (long long)D, path);
-        fired = true;
-      }
-
-      // One-shot dump of a 2-D [B, V] tensor's first row to a raw float32 file.
-      // Gated by `CT2_S2S_DUMP_LOGITS=<path>`; fires at most once per process.
-      static void dump_logits_once(const StorageView& t) {
-        static const char* path = std::getenv("CT2_S2S_DUMP_LOGITS");
-        if (!path || !*path) return;
-        static bool fired = false;
-        if (fired) return;
-        if (t.rank() != 2) return;
-        StorageView host = t.device() == Device::CPU ? t : t.to(Device::CPU);
-        if (host.dtype() != DataType::FLOAT32) return;
-        const dim_t V = host.dim(1);
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-          std::fprintf(stderr, "[s2s_dump] failed to open %s\n", path);
-          return;
-        }
-        out.write(reinterpret_cast<const char*>(host.data<float>()),
-                  static_cast<std::streamsize>(V * sizeof(float)));
-        std::fprintf(stderr, "[s2s_dump] wrote %lld logits floats to %s "
-                     "(logits ptr=%p data=%p)\n",
-                     (long long)V, path,
-                     (const void*)&t,
-                     (const void*)t.data<float>());
-        fired = true;
-      }
 
       // Build a float mask `[B, 1]` where entry b is 1.0 if `t < lengths[b]`,
       // else 0.0. `lengths` is a 1-D int32 tensor on the same device as the
@@ -304,14 +112,10 @@ namespace ctranslate2 {
 
       // Recurrent projection: [B, H] -> [B, 3H], then scale-only LN. Split
       // last axis into (rs, us, cs) by the Marian gate order [r | u | c].
-      probe("gru:prev_state", prev_state);
       StorageView s_proj(dtype, device);
       _recurrent_dense(prev_state, s_proj);
-      probe("gru:recurrent_proj", s_proj);
-      if (_ln_recurrent) {
+      if (_ln_recurrent)
         (*_ln_recurrent)(s_proj, s_proj);
-        probe("gru:recurrent_proj_ln", s_proj);
-      }
       StorageView rs(dtype, device), us(dtype, device), cs(dtype, device);
       ops::Split(-1, std::vector<dim_t>{H, H, H})(s_proj, rs, us, cs);
 
@@ -322,14 +126,10 @@ namespace ctranslate2 {
         if (!input)
           throw std::invalid_argument(
               "GRUCell with an input side requires a non-null input tensor");
-        probe("gru:input", *input);
         StorageView x_proj(dtype, device);
         (*_input_dense)(*input, x_proj);
-        probe("gru:input_proj", x_proj);
-        if (_ln_input) {
+        if (_ln_input)
           (*_ln_input)(x_proj, x_proj);
-          probe("gru:input_proj_ln", x_proj);
-        }
         ops::Split(-1, std::vector<dim_t>{H, H, H})(x_proj, rx, ux, cx);
       }
 
@@ -366,7 +166,6 @@ namespace ctranslate2 {
       StorageView weighted(dtype, device);
       ops::Mul()(u, diff, weighted);
       ops::Add()(c, weighted, new_state);
-      probe("gru:new_state", new_state);
     }
 
 
@@ -396,12 +195,9 @@ namespace ctranslate2 {
       // along the last axis with `b_att` as the shift (beta).
       const Device device = memory.device();
       const DataType dtype = _memory_dense.output_type();
-      probe("attn:memory_in", memory);
       StorageView proj(dtype, device);
       _memory_dense(memory, proj);
-      probe("attn:memory_proj", proj);
       _ln_context(proj, projected_memory);
-      probe("attn:memory_proj_ln", projected_memory);
     }
 
     void BahdanauAttention::compute(const StorageView& query,
@@ -466,19 +262,12 @@ namespace ctranslate2 {
       act.reshape(Shape{Bq * S, A});
       StorageView v_col(dtype, device);
       v_col.view(const_cast<float*>(_v.data<float>()), Shape{A, 1});
-      StorageView energy_flat(dtype, device);
-      ops::MatMul()(act, v_col, energy_flat);
-      energy_flat.reshape(Shape{Bq, S});
-      StorageView energy = std::move(energy_flat);
+      StorageView energy(dtype, device);
+      ops::MatMul()(act, v_col, energy);
+      energy.reshape(Shape{Bq, S});
 
-      probe("attn:query", query);
-      probe("attn:q_proj_ln", q);
-      probe("attn:pre_tanh", pre);
-      probe("attn:act", act);
-      probe("attn:energy", energy);
       // Masked softmax along time axis.
       ops::SoftMax()(energy, lengths_ptr, alignment);  // [Bq, S]
-      probe("attn:alignment", alignment);
 
       // Context: alignment [Bq, S] * memory [Bq, S, E_mem] -> [Bq, E_mem].
       // Compute as [Bq, 1, S] × [Bq, S, E_mem] -> [Bq, 1, E_mem] -> squeeze.
@@ -489,7 +278,6 @@ namespace ctranslate2 {
       ops::MatMul()(align_row, *mem_ptr, ctx3);  // [Bq, 1, E_mem]
       ctx3.reshape(Shape{Bq, E_mem});
       context = std::move(ctx3);
-      probe("attn:context", context);
     }
 
 
@@ -524,10 +312,6 @@ namespace ctranslate2 {
       // s1 = gru1(input_emb, prev_state).
       StorageView s1(dtype, device);
       _gru1(&input_emb, prev_state, s1);
-      {
-        static bool fired = false;
-        dump_row0_once("CT2_S2S_DUMP_S1", "s1", s1, fired);
-      }
 
       // (context, alignment) = attention(query=s1, projected_memory, memory, lengths).
       _attn.compute(s1, projected_memory, memory, memory_lengths, context, alignment);
@@ -544,29 +328,6 @@ namespace ctranslate2 {
       , _fwd(model, scope + "/forward_cell",  /*has_input=*/true, /*final=*/false)
       , _bwd(model, scope + "/backward_cell", /*has_input=*/true, /*final=*/false)
       , _dim_rnn(_fwd.output_size()) {
-      if (s2s_debug_enabled()) {
-        const StorageView& w = model.get_variable(scope + "/embeddings/weight");
-        std::fprintf(stderr,
-                     "[s2s_probe] model_var %s/embeddings/weight dtype=%d "
-                     "shape0=%lld shape1=%lld\n",
-                     scope.c_str(), static_cast<int>(w.dtype()),
-                     (long long)(w.rank() > 0 ? w.dim(0) : 0),
-                     (long long)(w.rank() > 1 ? w.dim(1) : 0));
-        const StorageView* s = model.get_variable_if_exists(scope + "/embeddings/weight_scale");
-        if (s) {
-          std::fprintf(stderr,
-                       "[s2s_probe] model_var %s/embeddings/weight_scale "
-                       "dtype=%d size=%lld\n",
-                       scope.c_str(), static_cast<int>(s->dtype()),
-                       (long long)s->size());
-          probe("enc:embedding_scale", *s);
-        } else {
-          std::fprintf(stderr,
-                       "[s2s_probe] model_var %s/embeddings/weight_scale: "
-                       "<not present>\n", scope.c_str());
-        }
-        probe("enc:embedding_table", w);
-      }
     }
 
     DataType BiGRUEncoder::output_type() const {
@@ -593,7 +354,6 @@ namespace ctranslate2 {
       // Embed ids [B, S] -> [B, S, E].
       StorageView emb(dtype, device);
       _embeddings(token_ids, emb);
-      probe("enc:src_emb", emb);
 
       // Forward pass: h_fwd[-1] = 0.
       StorageView h_fwd_prev(Shape{B, H}, dtype, device);
@@ -650,7 +410,6 @@ namespace ctranslate2 {
       for (auto& s : stacked)
         stacked_ptrs.push_back(&s);
       ops::Concat(1)(stacked_ptrs, output);  // [B, S, 2H]
-      probe("enc:output", output);
 
       // Zero out padded positions in the output (match TransformerEncoder's
       // post-padding semantics).
@@ -751,20 +510,16 @@ namespace ctranslate2 {
         mean_pool_memory(memory_cpu, lengths_cpu, pooled);
         if (device != Device::CPU)
           pooled = pooled.to(device);
-        probe("init:pooled", pooled);
 
         // Marian's `ff_state` is `tanh(LN(dot(x, W), gamma, b))`. Without
         // the tanh, the initial hidden state is unbounded and the decoder's
         // GRU gates get driven to saturation on step 0.
         StorageView h0(output_type(), device);
         _init_state_linear(pooled, h0);
-        probe("init:h0_linear", h0);
         StorageView h0_norm(output_type(), device);
         _init_state_ln(h0, h0_norm);
-        probe("init:h0_ln", h0_norm);
         StorageView h0_act(output_type(), device);
         ops::Tanh()(h0_norm, h0_act);
-        probe("init:h0_tanh", h0_act);
         hidden = std::move(h0_act);
 
         // Replicate to match the current (possibly beam-expanded) batch size.
@@ -797,46 +552,21 @@ namespace ctranslate2 {
       // words -> inits::zeros()) and :50 (training-time shift comment).
       if (step == 0)
         embed.zero();
-      if (s2s_debug_enabled()) {
-        std::fprintf(stderr, "[s2s_probe] === step=%lld ===\n", (long long)step);
-      }
-      probe("dec:tgt_ids", ids);
-      probe("dec:tgt_emb", embed);
 
       // On the first step, lazily build "projected_memory" and "hidden".
       const dim_t B = embed.dim(0);
-      if (step == 0)
-        ensure_lazy_state(state, B);
-      else
-        ensure_lazy_state(state, B);  // Idempotent after first call.
+      ensure_lazy_state(state, B);
 
       StorageView& memory = state.at("memory");
       StorageView& memory_lengths = state.at("memory_lengths");
       StorageView& projected_memory = state.at("projected_memory");
       StorageView& prev_hidden = state.at("hidden");
 
-      probe("dec:prev_hidden", prev_hidden);
-      probe("dec:projected_memory", projected_memory);
       StorageView new_hidden(dtype, device);
       StorageView context(dtype, device);
       StorageView alignment(dtype, device);
       _cell(embed, prev_hidden, projected_memory, memory, memory_lengths,
             new_hidden, context, alignment);
-      probe("dec:new_hidden", new_hidden);
-      probe("dec:context", context);
-      probe("dec:alignment", alignment);
-
-      // Env-var-gated one-shot dumps of the three deep-output inputs. These
-      // mirror MARIAN_DUMP_EMB / _STATE / _CTX on the Marian side so we can
-      // localize divergence per input before it feeds the deep-output MLP.
-      {
-        static bool d_emb = false, d_state = false, d_ctx = false, d_mem = false, d_align = false;
-        dump_row0_once("CT2_S2S_DUMP_EMB",       "emb",       embed,      d_emb);
-        dump_row0_once("CT2_S2S_DUMP_STATE",     "state",     new_hidden, d_state);
-        dump_row0_once("CT2_S2S_DUMP_CTX",       "context",   context,    d_ctx);
-        dump_row0_once("CT2_S2S_DUMP_MEMORY",    "memory",    memory,     d_mem);
-        dump_row0_once("CT2_S2S_DUMP_ALIGNMENT", "alignment", alignment,  d_align);
-      }
 
       // Deep-output: Marian builds `tanh(sum_i LN(W_i @ x_i, gamma_i, b_i))`
       // where `i` iterates over (embeddings, decoder hidden, aligned context).
@@ -846,64 +576,29 @@ namespace ctranslate2 {
       {
         StorageView proj(dtype, device);
         _hidden_embed.linear(embed, proj);
-        probe("deepout:proj_embed_linear", proj);
         _hidden_embed.layer_norm(proj, y0);
-        probe("deepout:proj_embed_ln", y0);
       }
       StorageView y1(dtype, device);
       {
         StorageView proj(dtype, device);
         _hidden_state.linear(new_hidden, proj);
-        probe("deepout:proj_state_linear", proj);
         _hidden_state.layer_norm(proj, y1);
-        probe("deepout:proj_state_ln", y1);
       }
       StorageView y2(dtype, device);
       {
         StorageView proj(dtype, device);
         _hidden_context.linear(context, proj);
-        probe("deepout:proj_context_linear", proj);
         _hidden_context.layer_norm(proj, y2);
-        probe("deepout:proj_context_ln", y2);
       }
       StorageView sum01(dtype, device);
       ops::Add()(y0, y1, sum01);
       StorageView sum012(dtype, device);
       ops::Add()(sum01, y2, sum012);
-      probe("deepout:sum", sum012);
       StorageView h_tilde(dtype, device);
       ops::Tanh()(sum012, h_tilde);
-      probe("deepout:h_tilde", h_tilde);
-      {
-        static bool once = false;
-        if (!once) {
-          std::fprintf(stderr,
-                       "[s2s_dump] BREADCRUMB-A: about to call dump_htilde_once "
-                       "(h_tilde rank=%d dtype=%d)\n",
-                       (int)h_tilde.rank(), (int)h_tilde.dtype());
-          std::fflush(stderr);
-          once = true;
-        }
-      }
-      dump_htilde_once(h_tilde);
-      {
-        static bool once = false;
-        if (!once) {
-          std::fprintf(stderr, "[s2s_dump] BREADCRUMB-B: returned from dump_htilde_once\n");
-          std::fflush(stderr);
-          once = true;
-        }
-      }
 
-      if (logits) {
-        // Dump bias BEFORE the matmul so we see the pristine _bias storage,
-        // not something that may have been overwritten by a fused op or
-        // aliased write into the output buffer.
-        dump_bias_once(_output.bias());
+      if (logits)
         _output(h_tilde, *logits);
-        probe("dec:logits", *logits);
-        dump_logits_once(*logits);
-      }
 
       if (attention) {
         // Single-step decoder contract: `[B, S]`. BeamSearch's greedy path

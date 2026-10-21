@@ -734,9 +734,12 @@ TEST(RNNTest, RNNDecoderSingleStepMatchesReference) {
   ASSERT_EQ(state.at("hidden").dim(1), H);
   ASSERT_EQ(logits.dim(0), B);
   ASSERT_EQ(logits.dim(1), V);
+  // Single-step contract: attention is [B, S] (rank 2). BeamSearch's greedy
+  // path indexes `{i, 0}` on it; a rank-3 `[B, 1, S]` would raise at
+  // decoding.cc. The beam path later expand_dims it back up.
+  ASSERT_EQ(attention.rank(), 2);
   ASSERT_EQ(attention.dim(0), B);
-  ASSERT_EQ(attention.dim(1), 1);
-  ASSERT_EQ(attention.dim(2), S);
+  ASSERT_EQ(attention.dim(1), S);
 }
 
 
