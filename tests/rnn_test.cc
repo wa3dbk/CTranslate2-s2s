@@ -565,9 +565,11 @@ TEST(RNNTest, CGRUDecoderCellMatchesReference) {
 }
 
 
-// Replicate_state must leave batch-only entries (memory, memory_lengths,
-// projected_memory) in place when the base Decoder expands the beam.
-TEST(RNNTest, RNNDecoderReplicateStateHonorsBatchOnlyEntries) {
+// Replicate_state replicates every entry across beams: memory,
+// memory_lengths, projected_memory and hidden all become `beam_size`-tiled.
+// This keeps BahdanauAttention::compute off a per-step `repeat_batch` on
+// the memory-side tensors (Opt 2 in the s2s perf series).
+TEST(RNNTest, RNNDecoderReplicateStateReplicatesAllEntriesAcrossBeams) {
   // Build a minimal RNNDecoder whose weights are irrelevant for this test;
   // we only exercise the replicate_state policy on the decoder instance.
   using namespace rnn_fixtures;
@@ -627,23 +629,26 @@ TEST(RNNTest, RNNDecoderReplicateStateHonorsBatchOnlyEntries) {
 
   layers::RNNDecoder decoder(model, "decoder");
 
-  EXPECT_FALSE(decoder.replicate_state("memory"));
-  EXPECT_FALSE(decoder.replicate_state("memory_lengths"));
-  EXPECT_FALSE(decoder.replicate_state("projected_memory"));
-  // The hidden state (per-beam) must be replicated.
+  EXPECT_TRUE(decoder.replicate_state("memory"));
+  EXPECT_TRUE(decoder.replicate_state("memory_lengths"));
+  EXPECT_TRUE(decoder.replicate_state("projected_memory"));
   EXPECT_TRUE(decoder.replicate_state("hidden"));
 
   // Build a state with memory + memory_lengths and request a beam replication:
-  // memory tensors should keep their original batch dim.
+  // both tensors should be tiled by `beam_size` so the attention compute
+  // path sees matching batch sizes without a per-step `repeat_batch`.
   layers::DecoderState state = decoder.initial_state();
   state["memory"] = StorageView({B, S, E_mem}, expected_encoder_output);
   state["memory_lengths"] = StorageView({B}, lengths);
 
-  decoder.replicate_state(state, /*beam_size=*/3);
-  ASSERT_EQ(state.at("memory").dim(0), B);
-  ASSERT_EQ(state.at("memory_lengths").dim(0), B);
-  // "hidden" was empty at this point so it stays empty after replication.
+  const dim_t beam = 3;
+  decoder.replicate_state(state, beam);
+  ASSERT_EQ(state.at("memory").dim(0), B * beam);
+  ASSERT_EQ(state.at("memory_lengths").dim(0), B * beam);
+  // "hidden" and "projected_memory" were empty at this point: empty views
+  // are skipped by Decoder::replicate_state, so they stay empty.
   EXPECT_TRUE(state.at("hidden").empty());
+  EXPECT_TRUE(state.at("projected_memory").empty());
 }
 
 

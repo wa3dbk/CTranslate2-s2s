@@ -209,36 +209,22 @@ namespace ctranslate2 {
       const Device device = query.device();
       const DataType dtype = _query_dense.output_type();
       const dim_t Bq = query.dim(0);
-      const dim_t B_mem = projected_memory.dim(0);
       const dim_t S = projected_memory.dim(1);
       const dim_t A = projected_memory.dim(2);
       const dim_t E_mem = memory.dim(2);
 
-      // During beam search `query` is beam-expanded (B_batch * beam) while
-      // `projected_memory`/`memory`/`memory_lengths` stay at B_batch (we keep
-      // them off the auto-replication path in `replicate_state`). Tile the
-      // memory-side tensors up to the query batch size for this call; the
-      // decoder's state is left untouched.
-      if (Bq % B_mem != 0)
+      // Memory-side tensors are kept beam-replicated by RNNDecoder (see
+      // `replicate_state`): the Decoder base calls `repeat_batch` on
+      // `memory` / `memory_lengths` / `projected_memory` once before the
+      // beam loop, and gathers them by `beam_indices` during per-step
+      // finished-hypothesis pruning. So their batch dim already matches
+      // `Bq` here — no per-step tiling.
+      if (projected_memory.dim(0) != Bq
+          || memory.dim(0)         != Bq
+          || memory_lengths.dim(0) != Bq) {
         throw std::invalid_argument(
-            "BahdanauAttention: query batch is not a multiple of memory batch");
-      const dim_t beam = Bq / B_mem;
-
-      // Fast path for beam == 1 (greedy): avoid an unnecessary deep copy by
-      // forwarding the state tensors directly.
-      StorageView pm_tiled(dtype, device);
-      StorageView mem_tiled(memory.dtype(), device);
-      StorageView lengths_tiled(memory_lengths.dtype(), device);
-      const StorageView* pm_ptr      = &projected_memory;
-      const StorageView* mem_ptr     = &memory;
-      const StorageView* lengths_ptr = &memory_lengths;
-      if (beam > 1) {
-        pm_tiled      = projected_memory;  repeat_batch(pm_tiled,      beam);
-        mem_tiled     = memory;            repeat_batch(mem_tiled,     beam);
-        lengths_tiled = memory_lengths;    repeat_batch(lengths_tiled, beam);
-        pm_ptr      = &pm_tiled;
-        mem_ptr     = &mem_tiled;
-        lengths_ptr = &lengths_tiled;
+            "BahdanauAttention: memory batch does not match query batch "
+            "(expected beam-replication via RNNDecoder::replicate_state)");
       }
 
       // Query side: q = ln_state(Wa * query) -> [Bq, A].
@@ -254,7 +240,7 @@ namespace ctranslate2 {
 
       // Pre-energy = tanh(q_bcast + projected_memory) -> [Bq, S, A].
       StorageView pre(dtype, device);
-      ops::Add()(q_bcast, *pm_ptr, pre);
+      ops::Add()(q_bcast, projected_memory, pre);
       StorageView act(dtype, device);
       ops::Tanh()(pre, act);
 
@@ -267,7 +253,7 @@ namespace ctranslate2 {
       energy.reshape(Shape{Bq, S});
 
       // Masked softmax along time axis.
-      ops::SoftMax()(energy, lengths_ptr, alignment);  // [Bq, S]
+      ops::SoftMax()(energy, &memory_lengths, alignment);  // [Bq, S]
 
       // Context: alignment [Bq, S] * memory [Bq, S, E_mem] -> [Bq, E_mem].
       // Compute as [Bq, 1, S] × [Bq, S, E_mem] -> [Bq, 1, E_mem] -> squeeze.
@@ -275,7 +261,7 @@ namespace ctranslate2 {
       align_row.shallow_copy(alignment);
       align_row.reshape(Shape{Bq, 1, S});
       StorageView ctx3(dtype, device);
-      ops::MatMul()(align_row, *mem_ptr, ctx3);  // [Bq, 1, E_mem]
+      ops::MatMul()(align_row, memory, ctx3);  // [Bq, 1, E_mem]
       ctx3.reshape(Shape{Bq, E_mem});
       context = std::move(ctx3);
     }
@@ -676,11 +662,19 @@ namespace ctranslate2 {
       }
     }
 
-    bool RNNDecoder::replicate_state(const std::string& name) const {
-      // Batch-only state entries: not replicated across beams.
-      if (name == "memory" || name == "memory_lengths" || name == "projected_memory")
-        return false;
-      return Decoder::replicate_state(name);
+    bool RNNDecoder::replicate_state(const std::string& /*name*/) const {
+      // Every state entry (hidden, memory, memory_lengths, projected_memory)
+      // is kept at [B*beam, ...] throughout decoding. The Decoder base class
+      // handles both initial beam replication (via `repeat_batch`) and
+      // per-step pruning (via `Gather(beam_indices)`), so attention compute
+      // sees matching batch sizes without a per-step tile.
+      //
+      // The memory tensors cost `beam_size`× more RAM than the previous
+      // batch-only layout; this is the same tradeoff the historical
+      // encoder-decoder path made, and it eliminates a per-step
+      // `repeat_batch` on three tensors (`projected_memory`, `memory`,
+      // `memory_lengths`) inside the hot attention loop.
+      return true;
     }
 
   }
