@@ -230,6 +230,8 @@ Otherwise `source /opt/intel/oneapi/mkl/latest/env/vars.sh` (needed to compile M
 
 **Honest caveats.** CT2's beam search is not bit-identical to Marian's at tie-breaks, so a 0.1–0.5 BLEU residual between the two runtimes on the same model is expected and not a bug. Int8 scale calibration is embedding-table-wide; models with extreme embedding ranges may show slightly larger BLEU drops under `--compute_type int8` than Transformer models.
 
+**Reference script.** [`tools/benchmark_s2s/speedup_comparison.sh`](tools/benchmark_s2s/speedup_comparison.sh) implements the recipe above: it auto-detects physical cores, enforces env hygiene, runs three fixed configs (Marian baseline, CT2 apples-to-apples, CT2 best) plus an optional int8 row, and prints a markdown table matching this section's format. Required env: `CT2_MODEL`, `MARIAN_NPZ`, `MARIAN_YML`, `VOCAB_SRC`, `VOCAB_TGT`, `SRC`. Set `REF` for BLEU and `WITH_INT8=1` for the fourth row.
+
 ### Design spec
 
 The architecture, weight mapping, converter guards, state-handling choices, and testing tiers for the s2s path live in [`README_s2s.md`](README_s2s.md). Read that if you're adding LSTM / `gru-nematus` support, relaxing a converter guard, extending alignment extraction, or wiring up CUDA fp16 for s2s.
